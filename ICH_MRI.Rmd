@@ -1,0 +1,861 @@
+---
+title: "Consiousness - MRI in ICH Project"
+output:
+  html_document: default
+  pdf_document: default
+  word_document: default
+---
+# Morphological data analysis (volumetrie & location)
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r preproc, include = FALSE}
+rm(list = ls())
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(reshape2)
+library(doBy)
+
+
+#setwd("E:/Experiments/BrainFlowMap Stuff/Ben files/MRI_ICH")
+
+setwd("E:/Experiments/ICH_MRI/Ben files/MRI_ICH")
+
+Loc <- read_excel("ICH_MRI_location-asr.xlsx", sheet=1)
+Vol <- read_excel("Jan_Claassen_ICH_Study_Calc.xlsx", sheet=1)
+Outcome <- read_excel("MRI Imaging list radiology comprehensive-br.xlsx", sheet=1)
+Death <-read_excel("DeathDates.xlsx", sheet=1)
+
+names(Loc)[names(Loc)=="Subfalcine herniation"] <- "sf_hern"
+names(Loc)[names(Loc)=="MRI date"] <- "MRI_date_Loc"
+
+names(Vol)[names(Vol)=="Hemorrhage Volume"] <- "Hg_vol"
+names(Vol)[names(Vol)=="Edema Volume"] <- "Ed_vol"
+names(Vol)[names(Vol)=="Total Brain Volume"] <- "Brain_vol"
+
+names(Outcome)[names(Outcome)=="Command score before discharge"] <- "follow"
+names(Outcome)[names(Outcome)=="Command Score @ time of MRI eval"] <- "MRI_Cs"
+
+names(Death)[names(Death)=="PATIENT_ID"] <- "MRN"
+
+# correction data
+# remove duplicate death dates (one day gap, keep first)
+Death[!is.na(Death$MRN) & Death$MRN==5508540,][2,]<-NA
+Death[!is.na(Death$MRN) & Death$MRN==1917504,][2,]<-NA
+```
+
+## 1) Check volume data
+**Note:** This need to be fixed w/ Key new data and Alex before recompute logistic regressions  
+(We still have a lot of NAs because of duplicates)
+
+#### Brain Volume:
+```{r volume, echo=FALSE, warning=FALSE, fig.cap="Brain volume"}
+# Control of  brain volumes  # to be fixed
+Vol$Brain_vol<-as.numeric(Vol$Brain_vol)
+Vol$Hg_vol<-as.numeric(Vol$Hg_vol)
+Vol$Ed_vol<-as.numeric(Vol$Ed_vol)
+Vol$MRN<-as.numeric(Vol$MRN)
+
+boxplot(Vol$Brain_vol)
+Vol[!is.na(Vol$Brain_vol) & Vol$Brain_vol == 0,]$Brain_vol<-NA
+summary(as.numeric(Vol$Brain_vol))
+```
+#### Hemorage Volume
+```{r, echo=FALSE, warning=FALSE, fig.cap="Hemorage volume"}
+# Control of  brain volumes  # to be fixed
+boxplot(Vol$Hg_vol)
+Vol[!is.na(Vol$Hg_vol) & Vol$Hg_vol == 0,]$Hg_vol<-NA
+summary(as.numeric(Vol$Hg_vol))
+```
+#### Edema Volume
+```{r, echo=FALSE, warning=FALSE, fig.cap="Edema volume"}
+# Control of  brain volumes  # to be fixed
+boxplot(Vol$Ed_vol)
+Vol[!is.na(Vol$Ed_vol) & Vol$Ed_vol == 0,]$Ed_vol<-NA
+summary(as.numeric(Vol$Ed_vol))
+```
+
+```{r, echo=FALSE}
+# Merging  ATTENTION here I take all Loc MRN for the anat plot (pb is that we still have duplicates MRN in Vol)
+
+#data.raw <-merge(Loc, Vol, by.x= c("MRN"), all.x=TRUE, all.y=FALSE)
+#data.raw <-merge( data.raw, Outcome, by=c("MRN"),all.x=TRUE)
+#data.raw <-merge( data.raw, Death, by=c("MRN"),all.x=TRUE)
+
+# data.raw <-merge(Loc, Outcome, by.x= c("MRN"), all.x=TRUE, all.y=FALSE)   # 
+# data.raw <-merge(data.raw, Death, by.x= c("MRN"), all.x=TRUE, all.y=FALSE)   # 
+
+data.raw <-merge(Loc, Vol, by.x= c("MRN"), all.x=TRUE, all.y=FALSE)
+data.raw <-merge( data.raw, Outcome, by=c("MRN"),all.x=TRUE)
+data.raw <-merge( data.raw, Death, by=c("MRN"),all.x=TRUE)
+
+# recode errors or ambiguous data
+# table (data.raw$follow); table (data.raw$MRI_Cs)
+data.raw[!is.na(data.raw$follow) & data.raw$follow=='3 or 4',]$follow=3
+data.raw[!is.na(data.raw$MRI_Cs) & data.raw$MRI_Cs == "4 or 5",]$MRI_Cs<- 4
+```
+
+## 2) Check consciousness data
+We have 158 patients with both anat location & consciousness mesurements (@MRI & discharge)
+
+Definition                         Score
+-----------                        -------
+No eyes openning                   0  
+Opens eyes to stimulation          1  
+Opens eyes spontaneously           2  
+Tracks/attends                     3  
+Follows simple commands            4  
+Follows complex commands/oriented  5
+
+
+Table: Consciousness ICU scale reminder.
+
+
+
+```{r, include = FALSE}
+# shape dates 
+data.raw$Discharge_date<-as.Date(data.raw$Discharge_date)
+data.raw$DEATH_DATE<-as.Date(data.raw$DEATH_DATE)
+data.raw$MRI_date_Loc<-as.numeric(data.raw$MRI_date_Loc)
+data.raw$MRI_date_Loc<-as.Date(data.raw$MRI_date_Loc,origin = "1899-12-30")
+
+# Missed patients following to get on Eclipse (DONE)
+data.raw[is.na(data.raw$follow),c("MRN","MRI_date_Loc")]
+```
+
+Patient who died in ICU:
+```{r died patients, echo=FALSE}
+dim(data.raw[!is.na(data.raw$DEATH_DATE) & (data.raw$Discharge_date>=data.raw$DEATH_DATE)==TRUE,])[1]
+
+# Correction for patient who died in ICU: "following at discharge" = 0  (n=1) 
+data.raw[!is.na(data.raw$DEATH_DATE) & (data.raw$Discharge_date>=data.raw$DEATH_DATE)==TRUE,]$follow<-0
+```
+
+```{r Consciousness data, echo=FALSE}
+# dataframe for anat plot
+loc_analyse.raw<-subset(data.raw,select=c(MRN,4,7:87,follow,MRI_Cs,Discharge_date,DEATH_DATE,MRI_date_Loc,mri_date,Hg_vol))
+
+loc_analyse.raw$follow<-as.integer(loc_analyse.raw$follow)
+loc_analyse.raw$MRI_Cs<-as.integer(loc_analyse.raw$MRI_Cs)
+
+barplot(table(loc_analyse.raw$MRI_Cs))
+title(main = list("1: Consiousness at MRI", font = 4))
+table(loc_analyse.raw$MRI_Cs)
+sum(table(loc_analyse.raw$MRI_Cs))
+
+barplot(table(loc_analyse.raw$follow))
+title(main = list("2: Consiousness at discharge", font = 4))
+table(loc_analyse.raw$follow)
+sum(table(loc_analyse.raw$follow))
+```
+
+
+
+```{r ipsi/contro, echo=FALSE}
+# Add ispi / controlateral variables
+
+#### Do the sub_tent and sus_tent checking ####
+# sub_tent_names <- c("AntPons_ICH_R",
+#                     "AntPons_ICH_L",
+#                     "Teg_ICH_R",
+#                     "Teg_ICH_L",
+#                     "Cereb_ICH_R",
+#                     "Cereb_ICH_L",
+#                     "Vermis_ICH",
+#                     "MB_ICH_C",
+#                     "MB_peduncle_ICH_R",
+#                     "MB_peduncle_ICH_L")
+# 
+# R_names <- c("TH_ant_ICH_R",
+#              "TH_lat_ICH_R",
+#              "TH_med_ICH_R",
+#              "TH_post_ICH_R",
+#              "GP_ICH_R",
+#              "PUT_ICH_R",
+#              "Caudate_ICH_R",
+#              "IC_ant_ICH_R",
+#              "IC_post_ICH_R",
+#              "FCx_ICH_R",
+#              "PCx_ICH_R",
+#              "TCx_ICH_R",
+#              "OCx_ICH_R")
+# 
+# L_names <- c("TH_ant_ICH_L",
+#              "TH_lat_ICH_L",
+#              "TH_med_ICH_L",
+#              "TH_post_ICH_L",
+#              "GP_ICH_L",
+#              "PUT_ICH_L",
+#              "Caudate_ICH_L",
+#              "IC_ant_ICH_L",
+#              "IC_post_ICH_L",
+#              "FCx_ICH_L",
+#              "PCx_ICH_L",
+#              "TCx_ICH_L",
+#              "OCx_ICH_L")
+
+
+
+
+### Try putting all R and L from sub_tent_names into the R_names and L_names ###
+
+sub_tent_names <- c("Vermis_ICH",
+                    "MB_ICH_C")
+
+R_names <- c("MB_peduncle_ICH_R",
+             "Cereb_ICH_R",
+             "Teg_ICH_R",
+             "AntPons_ICH_R",
+             "TH_ant_ICH_R",
+             "TH_lat_ICH_R",
+             "TH_med_ICH_R",
+             "TH_post_ICH_R",
+             "GP_ICH_R",
+             "PUT_ICH_R",
+             "Caudate_ICH_R",
+             "IC_ant_ICH_R",
+             "IC_post_ICH_R",
+             "FCx_ICH_R",
+             "PCx_ICH_R",
+             "TCx_ICH_R",
+             "OCx_ICH_R")
+
+L_names <- c("MB_peduncle_ICH_L",
+             "Cereb_ICH_L",
+             "Teg_ICH_L",
+             "AntPons_ICH_L",
+             "TH_ant_ICH_L",
+             "TH_lat_ICH_L",
+             "TH_med_ICH_L",
+             "TH_post_ICH_L",
+             "GP_ICH_L",
+             "PUT_ICH_L",
+             "Caudate_ICH_L",
+             "IC_ant_ICH_L",
+             "IC_post_ICH_L",
+             "FCx_ICH_L",
+             "PCx_ICH_L",
+             "TCx_ICH_L",
+             "OCx_ICH_L")
+
+
+
+# melt seperate tables containing just the MRN and the respective names, and then merge them together
+# to have 3 seperate columsns for each area to check.
+
+loc_analyse.mSub <- melt(loc_analyse.raw[,c("MRN", sub_tent_names)], id="MRN")
+loc_analyse.mR <- melt(loc_analyse.raw[,c("MRN", R_names)], id="MRN")
+loc_analyse.mL <- melt(loc_analyse.raw[,c("MRN", L_names)], id="MRN")
+
+# rename the variable and value column names
+colnames(loc_analyse.mSub)<-  c("MRN", "sub_tent_name", "sub_tent_value")
+colnames(loc_analyse.mR)  <-  c("MRN", "R_name", "R_value")
+colnames(loc_analyse.mL)  <-  c("MRN", "L_name", "L_value")
+
+# now merge.
+# This creates "duplicate" rows based on all the various combos you can (and have to) make
+# between all the Sub, R, and L names
+# but that shouldn't matter, because we're just checking if a 1 exists in any of these columns
+# per patient, and that shouldn't change even if rows are "duplicated"
+loc_analyse.m <- merge(loc_analyse.mSub, merge(loc_analyse.mL, loc_analyse.mR))
+
+# create two new columns, one for the sub_tent stuff and another for the L, R, Both, None stuff
+# then check each column for each patient and assign to these new columns accordingly
+
+loc_analyse.raw2<-loc_analyse.raw
+loc_analyse.raw2$sub_tent <- NA
+loc_analyse.raw2$sus_tent <- NA
+
+# find unique patient IDs to loop over
+ID.u <- unique(loc_analyse.raw2$MRN)
+
+# check via looping over each MRN
+# I think I need to do this without dplyr because
+# that way, when filtering the table, I can keep the same indices of those filtered rows
+# when assigning the value of 'sus_tentorial' back into the main table.
+
+for (i in 1:length(ID.u)) {
+  tmp <- loc_analyse.m[loc_analyse.m$MRN == ID.u[i], ]
+  
+  # check for sub_tent first
+  if (any(tmp$sub_tent_value >= 1)) {
+    loc_analyse.raw2[loc_analyse.raw2$MRN == ID.u[i], ]$sub_tent <- 1
+  } else {
+    loc_analyse.raw2[loc_analyse.raw2$MRN == ID.u[i], ]$sub_tent <- 0
+  }
+  
+  
+  # now check for the L, R, Both, None
+  if (any(tmp$L_value >= 1) & !any(tmp$R_value >= 1)) {  # if patient has lesion on left side and not right side
+    loc_analyse.raw2[loc_analyse.raw2$MRN == ID.u[i],]$sus_tent <- "L"
+    
+  } else if (!any(tmp$L_value >= 1) & any(tmp$R_value >= 1)) {  # if patient doesn't have lesion of left side but has on right side
+    loc_analyse.raw2[loc_analyse.raw2$MRN == ID.u[i],]$sus_tent <- "R"
+    
+  } else if (any(tmp$L_value >= 1) & any(tmp$R_value >= 1)) {  # if patient has lesion on both sides
+    loc_analyse.raw2[loc_analyse.raw2$MRN == ID.u[i],]$sus_tent <- "Both"
+    
+  } else if (!any(tmp$L_value >= 1) & !any(tmp$R_value >= 1)) {  # if patient doesn't have lesion on either side
+    loc_analyse.raw2[loc_analyse.raw2$MRN == ID.u[i],]$sus_tent <- "None"
+    
+  }
+}
+
+
+### So now loc_analyse.m contains info, for each patient, on whether or not
+### they had a lesion in the sub_tent area or if they had a lesion in the sus_tent area
+### on the left, right, both, or none of these sides.
+
+## BEN: Kevin I changed minimally your script to get one line / patient (filling loc_analyse.raw2) 
+```
+
+
+```{r recode following scale, echo=FALSE, warning=FALSE}
+
+loc_analyse.raw<- loc_analyse.raw2;
+# now loc_analyse.raw has the 2 more row sub_tent & sus_tent
+
+
+# recode following scale
+# in binary in xxx2
+Cs_cutoff=3
+loc_analyse.raw$follow2<-loc_analyse.raw$follow
+loc_analyse.raw[loc_analyse.raw$follow2 < Cs_cutoff,]$follow2<- 0
+loc_analyse.raw[loc_analyse.raw$follow2 >= Cs_cutoff,]$follow2<- 1
+loc_analyse.raw$MRI_Cs2<- loc_analyse.raw$MRI_Cs
+loc_analyse.raw[!is.na(loc_analyse.raw$MRI_Cs2) & loc_analyse.raw$MRI_Cs2 <Cs_cutoff,]$MRI_Cs2<- 0
+loc_analyse.raw[!is.na(loc_analyse.raw$MRI_Cs2) & loc_analyse.raw$MRI_Cs2 >=Cs_cutoff,]$MRI_Cs2<- 1
+
+# in 3 groups in xxx3
+loc_analyse.raw$follow3<-loc_analyse.raw$follow
+loc_analyse.raw[loc_analyse.raw$follow3 < 1,]$follow3<- 0
+loc_analyse.raw[(loc_analyse.raw$follow3 >= 1) & (loc_analyse.raw$follow3 <4)  ,]$follow3<- 1
+loc_analyse.raw[loc_analyse.raw$follow3 >= 4 ,]$follow3<- 2
+loc_analyse.raw$MRI_Cs3<- loc_analyse.raw$MRI_Cs
+loc_analyse.raw[!is.na(loc_analyse.raw$MRI_Cs3) & loc_analyse.raw$MRI_Cs3 <1,]$MRI_Cs3<- 0
+loc_analyse.raw[!is.na(loc_analyse.raw$MRI_Cs3) & (loc_analyse.raw$MRI_Cs3 >= 1) & (loc_analyse.raw$MRI_Cs3 <4) ,]$MRI_Cs3<- 1
+loc_analyse.raw[!is.na(loc_analyse.raw$MRI_Cs3) & loc_analyse.raw$MRI_Cs3 >=4,]$MRI_Cs3<- 2
+
+# plot with original 6 cat scale done in "plot consciousness data"
+```
+
+#### Split in 2 categories: 0 = No attending/traking / 1 = Attending/traking or better
+```{r, echo=FALSE}
+# plot with 2 cat
+barplot(table(loc_analyse.raw$MRI_Cs2))
+title(main = list("3: Consiousness at MRI", font = 4))
+barplot(table(loc_analyse.raw$follow2))
+title(main = list("4: Consiousness at discharge", font = 4))
+table(loc_analyse.raw$MRI_Cs2); table(loc_analyse.raw$follow2)
+```
+
+#### Split in 3 categories: 0 = Coma / 1 = "Awakening" (1,2,3) / 2 = Following commands (4,5)
+```{r, echo=FALSE,warning = FALSE}
+# plot with 3 cat
+barplot(table(loc_analyse.raw$MRI_Cs3))
+title(main = list("5: Consiousness at MRI", font = 4))
+barplot(table(loc_analyse.raw$follow3))
+title(main = list("6: Consiousness at discharge", font = 4))
+table(loc_analyse.raw$MRI_Cs3); table(loc_analyse.raw$follow3)
+sum(table(loc_analyse.raw$MRI_Cs3))
+
+
+# recodin cortex values >1 as 1
+loc_analyse.raw[,2:76]<- ifelse(loc_analyse.raw[,2:76]>=1,1,0)
+loc_analyse.raw[,2:76]<- lapply(loc_analyse.raw[,2:76], as.factor)
+
+# rm NAs
+#loc_analyse.raw <- loc_analyse.raw[complete.cases(loc_analyse.raw[,2:75]),] No need here
+
+```
+
+```{r, echo=FALSE,warning = FALSE}
+
+# adding new variables
+
+# Thalamus Thal_R Thal_L
+loc_analyse.raw$TH_ICH_L <- NA
+loc_analyse.raw$TH_ICH_R <- NA
+
+loc_analyse.raw$TH_ICH_L <- ifelse(loc_analyse.raw[,"TH_ant_ICH_L"]==1 |loc_analyse.raw[,"TH_med_ICH_L"]==1|loc_analyse.raw[,"TH_lat_ICH_L"]==1 |loc_analyse.raw[,"TH_post_ICH_L"]==1 ,1,0)
+
+loc_analyse.raw$TH_ICH_R <- ifelse(loc_analyse.raw[,"TH_ant_ICH_R"]==1 |loc_analyse.raw[,"TH_med_ICH_R"]==1|loc_analyse.raw[,"TH_lat_ICH_R"]==1 |loc_analyse.raw[,"TH_post_ICH_R"]==1 ,1,0)
+
+loc_analyse.raw$TH_edema_L <- NA
+loc_analyse.raw$TH_edema_R <- NA
+
+loc_analyse.raw$TH_edema_L <- ifelse(loc_analyse.raw[,"TH_ant_edema_L"]==1 |loc_analyse.raw[,"TH_med_edema_L"]==1|loc_analyse.raw[,"TH_lat_edema_L"]==1 |loc_analyse.raw[,"TH_post_edema_L"]==1 ,1,0)
+
+loc_analyse.raw$TH_edema_R <- ifelse(loc_analyse.raw[,"TH_ant_edema_R"]==1 |loc_analyse.raw[,"TH_med_edema_R"]==1|loc_analyse.raw[,"TH_lat_edema_R"]==1 |loc_analyse.raw[,"TH_post_edema_R"]==1 ,1,0)
+
+
+# Mesocicuite MesoC_R MesoC_L MesoC
+loc_analyse.raw$MesoC_ICH_R <- NA
+loc_analyse.raw$MesoC_ICH_L <- NA
+loc_analyse.raw$MesoC_ICH_Bi <- NA
+loc_analyse.raw$MesoC_ICH_Uni <- NA
+
+loc_analyse.raw$MesoC_ICH_R <- ifelse(loc_analyse.raw[,"FCx_ICH_R"]==1|
+                                  loc_analyse.raw[,"TH_ICH_R"]==1|
+                                  loc_analyse.raw[,"GP_ICH_R"]==1|
+                                  loc_analyse.raw[,"Caudate_ICH_R"]==1|
+                                  loc_analyse.raw[,"PUT_ICH_R"]==1|
+                                  loc_analyse.raw[,"MB_peduncle_ICH_R"]==1|
+                                  loc_analyse.raw[,"MB_ICH_C"]==1|
+                                  loc_analyse.raw[,"Teg_ICH_R"]==1 ,1,0)
+
+loc_analyse.raw$MesoC_ICH_L <- ifelse(loc_analyse.raw[,"FCx_ICH_L"]==1|
+                                  loc_analyse.raw[,"TH_ICH_L"]==1|
+                                  loc_analyse.raw[,"GP_ICH_L"]==1|
+                                  loc_analyse.raw[,"Caudate_ICH_L"]==1|
+                                  loc_analyse.raw[,"PUT_ICH_L"]==1|
+                                  loc_analyse.raw[,"MB_peduncle_ICH_L"]==1|
+                                  loc_analyse.raw[,"MB_ICH_C"]==1|
+                                  loc_analyse.raw[,"Teg_ICH_L"]==1 ,1,0)
+
+loc_analyse.raw$MesoC_ICH_Bi<- ifelse(loc_analyse.raw[,"MesoC_ICH_R"]==1 &
+                                  loc_analyse.raw[,"MesoC_ICH_L"]==1 ,1,0)
+
+loc_analyse.raw$MesoC_ICH_Uni<- ifelse(loc_analyse.raw[,"MesoC_ICH_R"]==1 |
+                                  loc_analyse.raw[,"MesoC_ICH_L"]==1 ,1,0)
+
+# Brainstem
+loc_analyse.raw$BS_ICH <- NA 
+loc_analyse.raw$BS_ICH <- ifelse(loc_analyse.raw[,"MB_peduncle_ICH_R"]==1|
+                              loc_analyse.raw[,"MB_peduncle_ICH_L"]==1|
+                              loc_analyse.raw[,"MB_ICH_C"]==1|
+                              loc_analyse.raw[,"Teg_ICH_R"]==1|
+                              loc_analyse.raw[,"Teg_ICH_L"]==1 ,1,0)
+
+```
+
+**Note:** MesoC = TH + GP + Caudate + PUT + Teg + MB_pedoncle + MB_C + FCx
+I took only ICH yet
+
+
+```{r, echo=FALSE,warning = FALSE}
+#  melting and using dplyr  (thanks Kevin)
+dat.m <- melt(loc_analyse.raw, id=c("MRN", "Discharge_date", "DEATH_DATE", "MRI_date_Loc", "mri_date", "follow2","MRI_Cs2", "follow3","MRI_Cs3"))
+
+# ERROR here why?
+### This happens because some of the columns being melted are factors with different levels from one column to another.
+### When it tries to melt these columns, it sees that the factor levels aren't the same between them, so it apparently
+### just drops the levels and converts everything to character.
+### So, basically, I don't think we really need to care about this warning.
+# BEN: OK
+
+dat.m$value<-as.numeric(dat.m$value)
+```
+
+## 3) Plot anatomical data 
+Percentage (not mean as ploted) of patient with a lesion (ICH or eadema) in each ROIs according to level of consciousness (at time of MRI or discharge))
+
+### Consiousness split in 2 categories
+#### Right / Left analyse
+
+```{r, echo=FALSE}
+# for follow at MRI
+avg2<- dat.m %>% 
+  group_by(MRI_Cs2, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ","Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_ICH_L","TH_med_ICH_L","TH_lat_ICH_L","TH_post_ICH_L",
+"TH_ant_ICH_R","TH_med_ICH_R","TH_lat_ICH_R","TH_post_ICH_R",
+"TH_ant_edema_L","TH_med_edema_L","TH_lat_edema_L","TH_post_edema_L", 
+"TH_ant_edema_R","TH_med_edema_R","TH_lat_edema_R","TH_post_edema_R") )) %>%
+  summarize(mean=mean(value,na.rm=TRUE))
+
+avg2$MRI_Cs2<-as.integer(avg2$MRI_Cs2);avg2$MRI_Cs2<-as.factor(avg2$MRI_Cs2)
+
+
+ggplot(data=na.omit(rbind(avg2[grep(pattern = "ICH", avg2$variable),],avg2[avg2$variable=="IVH",])), aes(x=variable, y=mean, fill=MRI_Cs2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip() +
+  labs(title = "7: ICH ~ Follow @ mri")
+
+ggplot(data=na.omit(avg2[grep(pattern = "edema", avg2$variable),  ]), aes(x=variable, y=mean, fill=MRI_Cs2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "8: Edema ~ Follow @ mri")
+
+
+# for follow at discharge
+avg1<- dat.m %>% 
+  group_by(follow2, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                              "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_ICH_L","TH_med_ICH_L","TH_lat_ICH_L","TH_post_ICH_L",
+"TH_ant_ICH_R","TH_med_ICH_R","TH_lat_ICH_R","TH_post_ICH_R",
+"TH_ant_edema_L","TH_med_edema_L","TH_lat_edema_L","TH_post_edema_L", 
+"TH_ant_edema_R","TH_med_edema_R","TH_lat_edema_R","TH_post_edema_R") )) %>%
+  #summarize(mean=mean(value,na.rm=TRUE), sd=sd(value,na.rm=TRUE)) no need sd (%)
+  summarize(mean=mean(value,na.rm=TRUE))
+  
+
+avg1$follow2<-as.integer(avg1$follow2);avg1$follow2<-as.factor(avg1$follow2)
+
+ggplot(data=rbind(avg1[grep(pattern = "ICH", avg1$variable),],avg1[avg1$variable=="IVH",]), aes(x=variable, y=mean, fill=follow2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip() +
+  labs(title = "9: ICH ~ Follow @ discharge")
+
+ggplot(data=avg1[grep(pattern = "edema", avg1$variable),  ], aes(x=variable, y=mean, fill=follow2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "10: Edema ~ Follow @ discharge")
+
+
+```
+
+
+#### Ipsi / Controlateral analyse
+
+In the following table, left 0/1 code corresponds to infra-tentorial ICH and R/L.. to supra-tentorial ICH  
+**Note:** We have one patients without infra or supra tent ICH or IVH (check w/ Alex)
+
+```{r}
+table(loc_analyse.raw2$sub_tent,loc_analyse.raw2$sus_tent)
+sum(table(loc_analyse.raw2$sub_tent,loc_analyse.raw2$sus_tent))
+
+# patients without any hemorrage ??
+loc_analyse.raw2[loc_analyse.raw2$IVH==0 & loc_analyse.raw2$sub_tent==0 & loc_analyse.raw2$sus_tent=="None" ,]$MRN
+```
+
+```{r}
+#n=
+62+7+52+5
+```
+
+
+```{r, echo=FALSE, warning=FALSE}
+## analyse ipsi / contro
+loc_analyse.raw3<-loc_analyse.raw[loc_analyse.raw$sus_tent=='L',]
+
+# R->contro L->ipsi
+
+colnames(loc_analyse.raw3) <- c(
+  "MRN", "IVH", "AntPons_edema_ipsi", "AntPons_edema_contro",    
+  "AntPons_ICH_ipsi",   "AntPons_ICH_contro",   "Teg_edema_ipsi",    
+   "Teg_edema_contro",     "Teg_ICH_ipsi",       "Teg_ICH_contro",      
+   "MB_edema_C",      "MB_peduncle_edema_ipsi", "MB_peduncle_edema_contro",    
+   "MB_ICH_C",        "MB_peduncle_ICH_ipsi",   "MB_peduncle_ICH_contro",  
+   "TH_ant_edema_ipsi",  "TH_ant_edema_contro",  "TH_lat_edema_ipsi", 
+   "TH_lat_edema_contro",  "TH_med_edema_ipsi",  "TH_med_edema_contro", 
+   "TH_post_edema_ipsi", "TH_post_edema_contro", "TH_ant_ICH_ipsi",   
+   "TH_ant_ICH_contro",    "TH_lat_ICH_ipsi",    "TH_lat_ICH_contro",   
+   "TH_med_ICH_ipsi",    "TH_med_ICH_contro",    "TH_post_ICH_ipsi",  
+   "TH_post_ICH_contro",   "GP_edema_ipsi",      "GP_edema_contro",     
+   "PUT_edema_ipsi",     "PUT_edema_contro",     "Caudate_edema_ipsi",    
+   "Caudate_edema_contro", "IC_ant_edema_ipsi",  "IC_ant_edema_contro", 
+   "IC_post_edema_ipsi", "IC_post_edema_contro", "GP_ICH_ipsi",       
+   "GP_ICH_contro",        "PUT_ICH_ipsi",       "PUT_ICH_contro",      
+   "Caudate_ICH_ipsi",   "Caudate_ICH_contro",   "IC_ant_ICH_ipsi",   
+   "IC_ant_ICH_contro",    "IC_post_ICH_ipsi",   "IC_post_ICH_contro",  
+   "FCx_edema_ipsi",     "FCx_edema_contro",     "Hypo_edema_C",   
+   "FCx_ICH_ipsi",       "FCx_ICH_contro",       "Hypo_ICH_C",     
+   "PCx_edema_ipsi",     "PCx_edema_contro",     "PCx_ICH_ipsi",      
+   "PCx_ICH_contro",       "TCx_edema_ipsi",     "TCx_edema_contro",    
+   "TCx_ICH_ipsi",       "TCx_ICH_contro",       "OCx_edema_ipsi",    
+   "OCx_edema_contro",     "OCx_ICH_ipsi",       "OCx_ICH_contro",      
+   "Cereb_edema_ipsi",   "Cereb_edema_contro",   "Vermis_edema",   
+   "Cereb_ICH_ipsi",     "Cereb_ICH_contro",     "Vermis_ICH",     
+   "sf_hern", "Uncal herniation (to which side)","Transtentorial herniation",      
+   "Cerebellar tonsillar herniation", "MLS [mm]",        "Old stroke",     
+   "Old ICH", "follow",  "MRI_Cs", 
+   "Discharge_date",  "DEATH_DATE",      "MRI_date_Loc",   
+   "mri_date",        "sub_tent",        "sus_tent",       
+   "follow2", "MRI_Cs2", "follow3",        
+   "MRI_Cs3", "TH_ICH_ipsi", "TH_ICH_contro" , "TH_edema_ipsi", "TH_edema_contro",
+  "MesoC_ICH_contro", "MesoC_ICH_ipsi", "MesoC_ICH_Bi", "MesoC_ICH_Uni", "BS_ICH" )
+
+# R->contro L->ipsi
+
+temp<-loc_analyse.raw[loc_analyse.raw$sus_tent=='R',]
+
+# L->contro R->ipsi
+
+colnames(temp) <- c(
+  "MRN", "IVH","AntPons_edema_contro", "AntPons_edema_ipsi",    
+  "AntPons_ICH_contro",   "AntPons_ICH_ipsi",   "Teg_edema_contro",    
+  "Teg_edema_ipsi",     "Teg_ICH_contro",       "Teg_ICH_ipsi",      
+  "MB_edema_C",      "MB_peduncle_edema_contro", "MB_peduncle_edema_ipsi",    
+  "MB_ICH_C",        "MB_peduncle_ICH_contro",   "MB_peduncle_ICH_ipsi",  
+  "TH_ant_edema_contro",  "TH_ant_edema_ipsi",  "TH_lat_edema_contro", 
+  "TH_lat_edema_ipsi",  "TH_med_edema_contro",  "TH_med_edema_ipsi", 
+  "TH_post_edema_contro", "TH_post_edema_ipsi", "TH_ant_ICH_contro",   
+  "TH_ant_ICH_ipsi",    "TH_lat_ICH_contro",    "TH_lat_ICH_ipsi",   
+  "TH_med_ICH_contro",    "TH_med_ICH_ipsi",    "TH_post_ICH_contro",  
+  "TH_post_ICH_ipsi",   "GP_edema_contro",      "GP_edema_ipsi",     
+  "PUT_edema_contro",     "PUT_edema_ipsi",     "Caudate_edema_contro",    
+  "Caudate_edema_ipsi", "IC_ant_edema_contro",  "IC_ant_edema_ipsi", 
+  "IC_post_edema_contro", "IC_post_edema_ipsi", "GP_ICH_contro",       
+  "GP_ICH_ipsi",        "PUT_ICH_contro",       "PUT_ICH_ipsi",      
+  "Caudate_ICH_contro",   "Caudate_ICH_ipsi",   "IC_ant_ICH_contro",   
+  "IC_ant_ICH_ipsi",    "IC_post_ICH_contro",   "IC_post_ICH_ipsi",  
+  "FCx_edema_contro",     "FCx_edema_ipsi",     "Hypo_edema_C",   
+  "FCx_ICH_contro",       "FCx_ICH_ipsi",       "Hypo_ICH_C",     
+  "PCx_edema_contro",     "PCx_edema_ipsi",     "PCx_ICH_contro",      
+  "PCx_ICH_ipsi",       "TCx_edema_contro",     "TCx_edema_ipsi",    
+  "TCx_ICH_contro",       "TCx_ICH_ipsi",       "OCx_edema_contro",    
+  "OCx_edema_ipsi",     "OCx_ICH_contro",       "OCx_ICH_ipsi",      
+  "Cereb_edema_contro",   "Cereb_edema_ipsi",   "Vermis_edema",   
+  "Cereb_ICH_contro",     "Cereb_ICH_ipsi",     "Vermis_ICH",     
+  "sf_hern", "Uncal herniation (to which side)","Transtentorial herniation",      
+  "Cerebellar tonsillar herniation", "MLS [mm]",        "Old stroke",     
+  "Old ICH", "follow",  "MRI_Cs", 
+  "Discharge_date",  "DEATH_DATE",      "MRI_date_Loc",   
+  "mri_date",        "sub_tent",        "sus_tent",       
+  "follow2", "MRI_Cs2", "follow3",        
+  "MRI_Cs3", "TH_ICH_contro", "TH_ICH_ipsi" , "TH_edema_contro", "TH_edema_ipsi",
+  "MesoC_ICH_ipsi", "MesoC_ICH_contro", "MesoC_ICH_Bi", "MesoC_ICH_Uni", "BS_ICH" )
+
+# L->contro R->ipsi
+
+loc_analyse.raw3<-rbind(temp,loc_analyse.raw3)
+
+
+dat2.m <- melt(loc_analyse.raw3, id=c("MRN", "Discharge_date", "DEATH_DATE", "MRI_date_Loc", "mri_date", "follow2","MRI_Cs2", "follow3","MRI_Cs3"))
+dat2.m$value<-as.numeric(dat2.m$value)
+
+# for follow at MRI
+avg2<- dat2.m %>% 
+  group_by(MRI_Cs2, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                              "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_edema_contro",  "TH_ant_edema_ipsi",  "TH_lat_edema_contro", 
+  "TH_lat_edema_ipsi",  "TH_med_edema_contro",  "TH_med_edema_ipsi", 
+  "TH_post_edema_contro", "TH_post_edema_ipsi", "TH_ant_ICH_contro",   
+  "TH_ant_ICH_ipsi",    "TH_lat_ICH_contro",    "TH_lat_ICH_ipsi",   
+  "TH_med_ICH_contro",    "TH_med_ICH_ipsi",    "TH_post_ICH_contro",  
+  "TH_post_ICH_ipsi") )) %>%
+  summarize(mean=mean(value,na.rm=TRUE))
+
+avg2$MRI_Cs2<-as.integer(avg2$MRI_Cs2);avg2$MRI_Cs2<-as.factor(avg2$MRI_Cs2)
+
+ggplot(data=na.omit(rbind(avg2[grep(pattern = "ICH", avg2$variable),  ],avg2[avg2$variable=="IVH",])), aes(x=variable, y=mean, fill=MRI_Cs2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip() +
+  labs(title = "11: ICH ~ Follow @ mri")
+
+ggplot(data=na.omit(avg2[grep(pattern = "edema", avg2$variable),  ]), aes(x=variable, y=mean, fill=MRI_Cs2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "12: Edema ~ Follow @ mri")
+
+
+
+# for follow at discharge
+avg1<- dat2.m %>% 
+  group_by(follow2, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                              "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_edema_contro",  "TH_ant_edema_ipsi",  "TH_lat_edema_contro", 
+  "TH_lat_edema_ipsi",  "TH_med_edema_contro",  "TH_med_edema_ipsi", 
+  "TH_post_edema_contro", "TH_post_edema_ipsi", "TH_ant_ICH_contro",   
+  "TH_ant_ICH_ipsi",    "TH_lat_ICH_contro",    "TH_lat_ICH_ipsi",   
+  "TH_med_ICH_contro",    "TH_med_ICH_ipsi",    "TH_post_ICH_contro",  
+  "TH_post_ICH_ipsi") )) %>%
+  #summarize(mean=mean(value,na.rm=TRUE), sd=sd(value,na.rm=TRUE)) no need sd (%)
+  summarize(mean=mean(value,na.rm=TRUE))
+
+
+avg1$follow2<-as.integer(avg1$follow2);avg1$follow2<-as.factor(avg1$follow2)
+
+ggplot(data=rbind(avg1[grep(pattern = "ICH", avg1$variable),  ],avg1[avg1$variable=="IVH",]), aes(x=variable, y=mean, fill=follow2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "13: ICH ~ Follow @ discharge")
+
+ggplot(data=avg1[grep(pattern = "edema", avg1$variable),  ], aes(x=variable, y=mean, fill=follow2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "14: Edema ~ Follow @ discharge")
+
+```
+
+
+### Consiousness split in 3 categories
+#### according to Right / Left
+```{r, echo=FALSE}
+# for follow at MRI
+avg2<- dat.m %>% 
+  group_by(MRI_Cs3, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                              "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_edema_contro",  "TH_ant_edema_ipsi",  "TH_lat_edema_contro", 
+  "TH_lat_edema_ipsi",  "TH_med_edema_contro",  "TH_med_edema_ipsi", 
+  "TH_post_edema_contro", "TH_post_edema_ipsi", "TH_ant_ICH_contro",   
+  "TH_ant_ICH_ipsi",    "TH_lat_ICH_contro",    "TH_lat_ICH_ipsi",   
+  "TH_med_ICH_contro",    "TH_med_ICH_ipsi",    "TH_post_ICH_contro",  
+  "TH_post_ICH_ipsi") )) %>%
+  summarize(mean=mean(value,na.rm=TRUE))
+
+avg2$MRI_Cs3<-as.integer(avg2$MRI_Cs3);avg2$MRI_Cs3<-as.factor(avg2$MRI_Cs3)
+
+
+
+ggplot(data=na.omit(rbind(avg2[grep(pattern = "ICH", avg2$variable),  ],avg2[avg2$variable=="IVH",])), aes(x=variable, y=mean, fill=MRI_Cs3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip() +
+  labs(title = "15: ICH ~ Follow @ mri")
+
+ggplot(data=na.omit(avg2[grep(pattern = "edema", avg2$variable),  ]), aes(x=variable, y=mean, fill=MRI_Cs3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "16: Edema ~ Follow @ mri")
+
+
+# for follow at discharge
+avg1<- dat.m %>% 
+  group_by(follow3, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                                "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_edema_contro",  "TH_ant_edema_ipsi",  "TH_lat_edema_contro", 
+  "TH_lat_edema_ipsi",  "TH_med_edema_contro",  "TH_med_edema_ipsi", 
+  "TH_post_edema_contro", "TH_post_edema_ipsi", "TH_ant_ICH_contro",   
+  "TH_ant_ICH_ipsi",    "TH_lat_ICH_contro",    "TH_lat_ICH_ipsi",   
+  "TH_med_ICH_contro",    "TH_med_ICH_ipsi",    "TH_post_ICH_contro",  
+  "TH_post_ICH_ipsi") )) %>%
+  #summarize(mean=mean(value,na.rm=TRUE), sd=sd(value,na.rm=TRUE)) no need sd (%)
+  summarize(mean=mean(value,na.rm=TRUE))
+  
+
+avg1$follow3<-as.integer(avg1$follow3);avg1$follow3<-as.factor(avg1$follow3)
+
+ggplot(data=rbind(avg1[grep(pattern = "ICH", avg1$variable),  ],avg1[avg1$variable=="IVH",]), aes(x=variable, y=mean, fill=follow3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip() +
+  labs(title = "17: ICH ~ Follow @ discharge")
+
+ggplot(data=avg1[grep(pattern = "edema", avg1$variable),  ], aes(x=variable, y=mean, fill=follow3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "18: Edema ~ Follow @ discharge")
+
+
+```
+
+
+#### according to Ipsi / Controlateral
+```{r, echo=FALSE, warning=FALSE}
+## analyse ipsi / contro
+library(cumplyr)
+library(scales)
+library(RColorBrewer)
+
+table(loc_analyse.raw3$MRI_Cs3)
+sum(table(loc_analyse.raw3$MRI_Cs3))
+
+# for follow at MRI
+avg2<- dat2.m %>% 
+  group_by(MRI_Cs3, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                                "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_edema_contro",  "TH_ant_edema_ipsi",  "TH_lat_edema_contro", 
+  "TH_lat_edema_ipsi",  "TH_med_edema_contro",  "TH_med_edema_ipsi", 
+  "TH_post_edema_contro", "TH_post_edema_ipsi", "TH_ant_ICH_contro",   
+  "TH_ant_ICH_ipsi",    "TH_lat_ICH_contro",    "TH_lat_ICH_ipsi",   
+  "TH_med_ICH_contro",    "TH_med_ICH_ipsi",    "TH_post_ICH_contro",  
+  "TH_post_ICH_ipsi") )) %>%
+  summarize(mean=mean(value,na.rm=TRUE))
+
+avg2$MRI_Cs3<-as.integer(avg2$MRI_Cs3);avg2$MRI_Cs3<-as.factor(avg2$MRI_Cs3)
+
+ggplot(data=na.omit(rbind(avg2[grep(pattern = "ICH", avg2$variable),],avg2[avg2$variable=="IVH",])), aes(x=variable, y=mean, fill=MRI_Cs3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip() +
+  labs(title = "19: ICH ~ Follow @ mri")
+
+ggplot( data=na.omit(rbind(avg2[grep(pattern = "ICH", avg2$variable),],avg2[avg2$variable=="IVH",]))) + 
+          geom_tile(aes(x=variable, y=MRI_Cs3, fill=mean))+
+          scale_fill_gradientn(colours=rev(brewer.pal(10,"Spectral")), limits=c(0,1))+
+          coord_flip()+
+          ggtitle("Plot for Sketch 19_2: ICH ~ Follow @ mri")
+
+ggplot(data=na.omit(avg2[grep(pattern = "edema", avg2$variable),  ]), aes(x=variable, y=mean, fill=MRI_Cs3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "20: Edema ~ Follow @ mri")
+
+# for follow at discharge
+avg1<- dat2.m %>% 
+  group_by(follow3, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                                "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C","TH_ant_edema_contro",  "TH_ant_edema_ipsi",  "TH_lat_edema_contro", 
+  "TH_lat_edema_ipsi",  "TH_med_edema_contro",  "TH_med_edema_ipsi", 
+  "TH_post_edema_contro", "TH_post_edema_ipsi", "TH_ant_ICH_contro",   
+  "TH_ant_ICH_ipsi",    "TH_lat_ICH_contro",    "TH_lat_ICH_ipsi",   
+  "TH_med_ICH_contro",    "TH_med_ICH_ipsi",    "TH_post_ICH_contro",  
+  "TH_post_ICH_ipsi") )) %>%
+  #summarize(mean=mean(value,na.rm=TRUE), sd=sd(value,na.rm=TRUE)) no need sd (%)
+  summarize(mean=mean(value,na.rm=TRUE))
+  
+avg1$follow3<-as.integer(avg1$follow3);avg1$follow3<-as.factor(avg1$follow3)
+
+ggplot(data=na.omit(rbind(avg1[grep(pattern = "ICH", avg1$variable),  ],avg1[avg1$variable=="IVH",])), aes(x=variable, y=mean, fill=follow3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "21: ICH ~ Follow @ discharge")
+
+ggplot( data=na.omit(rbind(avg1[grep(pattern = "ICH", avg1$variable),  ],avg1[avg1$variable=="IVH",]))) + 
+          geom_tile(aes(x=variable, y=follow3, fill=mean))+
+          scale_fill_gradientn(colours=rev(brewer.pal(10,"Spectral")), limits=c(0,1))+
+          coord_flip()+
+          ggtitle("Plot for Sketch 21_2: ICH ~ Follow @ mri")
+
+
+ggplot(data=avg1[grep(pattern = "edema", avg1$variable),  ], aes(x=variable, y=mean, fill=follow3) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "22: Edema ~ Follow @ discharge")
+
+```
+
+
+
+#### subgroup of patient with bilateral sub-tentorial hemorrage (n=9)
+
+```{r, echo=FALSE, warning=FALSE}
+## analyse ipsi / contro
+
+dat3.m <- melt(loc_analyse.raw[loc_analyse.raw$sus_tent=='Both',], id=c("MRN", "Discharge_date", "DEATH_DATE", "MRI_date_Loc", "mri_date", "follow2","MRI_Cs2", "follow3","MRI_Cs3"))
+dat3.m$value<-as.numeric(dat3.m$value)
+
+# for follow at MRI
+avg2<- dat3.m %>% 
+  group_by(MRI_Cs2, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                              "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C") )) %>%
+  summarize(mean=mean(value,na.rm=TRUE))
+
+table(loc_analyse.raw[loc_analyse.raw$sus_tent=='Both',]$MRI_Cs2)
+
+avg2$MRI_Cs2<-as.integer(avg2$MRI_Cs2);avg2$MRI_Cs2<-as.factor(avg2$MRI_Cs2)
+
+ggplot(data=na.omit(avg2[grep(pattern = "edema", avg2$variable),  ]), aes(x=variable, y=mean, fill=MRI_Cs2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "23: Edema ~ Follow @ mri")
+
+ggplot(data=na.omit(avg2[grep(pattern = "ICH", avg2$variable),]), aes(x=variable, y=mean, fill=MRI_Cs2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip() +
+  labs(title = "24: ICH ~ Follow @ mri")
+
+# for follow at discharge
+avg1<- dat3.m %>% 
+  group_by(follow2, variable) %>%
+  filter( !(variable  %in%  c("Cerebellar tonsillar herniation","MLS [mm]", "Old stroke", "Old ICH",  "Uncal herniation (to which side) ","Transtentorial herniation ",
+                              "Uncal herniation (to which side)","Transtentorial herniation","sf_hern", "Hypo_edema_C","Hypo_ICH_C") )) %>%
+  #summarize(mean=mean(value,na.rm=TRUE), sd=sd(value,na.rm=TRUE)) no need sd (%)
+  summarize(mean=mean(value,na.rm=TRUE))
+
+table(loc_analyse.raw[loc_analyse.raw$sus_tent=='Both',]$follow2)
+
+avg1$follow2<-as.integer(avg1$follow2);avg1$follow2<-as.factor(avg1$follow2)
+
+ggplot(data=avg1[grep(pattern = "edema", avg1$variable),  ], aes(x=variable, y=mean, fill=follow2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "25: Edema ~ Follow @ discharge")
+
+ggplot(data=avg1[grep(pattern = "ICH", avg1$variable),  ], aes(x=variable, y=mean, fill=follow2) )+
+  geom_bar(stat="identity", position=position_dodge()) +
+  coord_flip()+
+  labs(title = "26: ICH ~ Follow @ discharge")
+```

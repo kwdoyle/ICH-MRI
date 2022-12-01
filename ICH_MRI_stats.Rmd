@@ -1,0 +1,2424 @@
+
+```{r Load Data, include=FALSE}
+library(openxlsx)
+library(dplyr)
+
+loc_analyse.raw3 <- read.xlsx("E:/Experiments/ICH_MRI/MRI_Merged_Data_158patients.xlsx")
+
+# convert dates
+loc_analyse.raw3$Discharge_date<-as.Date(loc_analyse.raw3$Discharge_date,origin = "1899-12-30")
+loc_analyse.raw3$DEATH_DATE<-as.Date(loc_analyse.raw3$DEATH_DATE,origin = "1899-12-30")
+loc_analyse.raw3$MRI_date_Loc<-as.Date(loc_analyse.raw3$MRI_date_Loc,origin = "1899-12-30")
+
+# change variable names
+names(loc_analyse.raw3)[which(names(loc_analyse.raw3)=='Uncal.herniation.(to.which.side)')] <- "Uncal_herniation_to_which_side"
+names(loc_analyse.raw3)[which(names(loc_analyse.raw3)=='MLS.[mm]')] <- "MLS"  # change this too and then also change the name in the other logisitc regress
+
+# remove column "Hypo_ICH_C", because apparently we're not using it and alsoe
+# there is a patient with an NA value here.
+loc_analyse.raw3 <- loc_analyse.raw3[,-which(names(loc_analyse.raw3) == "Hypo_ICH_C")]
+# this one too.
+loc_analyse.raw3 <- loc_analyse.raw3[,-which(names(loc_analyse.raw3) == "Uncal_herniation_to_which_side")]
+
+# remove the 'summary' Meso_ICH_2 columns
+loc_analyse.raw3 <- loc_analyse.raw3[,-which(names(loc_analyse.raw3) == "Meso_ICH_2_ipsi" | names(loc_analyse.raw3) == "Meso_ICH_2_contro")]
+
+
+
+## remove all the TH sub-regions
+# loc_analyse.raw3 <- loc_analyse.raw3[,-which(names(loc_analyse.raw3) %in% c("TH_ant_edema_contro", 
+# "TH_ant_edema_ipsi",   
+# "TH_lat_edema_contro", 
+# "TH_lat_edema_ipsi",   
+# "TH_med_edema_contro", 
+# "TH_med_edema_ipsi",   
+# "TH_post_edema_contro",
+# "TH_post_edema_ipsi",  
+# "TH_ant_ICH_contro",   
+# "TH_ant_ICH_ipsi",     
+# "TH_lat_ICH_contro",   
+# "TH_lat_ICH_ipsi",     
+# "TH_med_ICH_contro",   
+# "TH_med_ICH_ipsi",     
+# "TH_post_ICH_contro",  
+# "TH_post_ICH_ipsi"))]
+
+
+
+# remove all edema columns
+#loc_analyse.raw3 <- loc_analyse.raw3[,-grep("edema", names(loc_analyse.raw3))]
+
+
+
+## Impute missing values for Hg_vol - take the average of all other values
+#loc_analyse.raw3$Hg_vol[which(is.na(loc_analyse.raw3$Hg_vol))] <- mean(loc_analyse.raw3$Hg_vol, na.rm=T)
+
+### For now, remove the 6 patients with missing Hg_vols
+#loc_analyse.raw3 <- dplyr::filter(loc_analyse.raw3, is.na(Hg_vol)==F)
+
+
+## change the additional 6 other patients with missing Edema volume to 0
+loc_analyse.raw3[,"Ed_vol"][which(is.na(loc_analyse.raw3[,"Ed_vol"]))] <- 0
+
+
+
+
+
+### Normalized Hemmmmorragage (sp) volume
+# removes outlier w/ small brain b/c of incomplete scan (according to Kay)
+# Will replace this value with the mean value
+min_val <- which(loc_analyse.raw3$Brain_vol == min(loc_analyse.raw3$Brain_vol))
+mBV <- mean(loc_analyse.raw3$Brain_vol[-min_val])
+# replace min value
+loc_analyse.raw3$Brain_vol[min_val] <- mBV
+
+
+loc_analyse.raw3$Hg_vol_Norm <- (loc_analyse.raw3$Hg_vol * loc_analyse.raw3$Brain_vol) / mBV
+# plot to compare to original
+boxplot(loc_analyse.raw3$Hg_vol_Norm)
+
+# normalize edema volume
+## ...these didn't change that much
+loc_analyse.raw3$Ed_vol_Norm <- (loc_analyse.raw3$Ed_vol * loc_analyse.raw3$Brain_vol) / mBV
+
+
+## Now get the z-score for these normalized brain volumes to normalize them again
+## basically so that the values aren't so big
+mHgvN <- mean(loc_analyse.raw3$Hg_vol_Norm)
+sdHgv <- sd(loc_analyse.raw3$Hg_vol_Norm)
+loc_analyse.raw3$Hg_vol_zscore <- (loc_analyse.raw3$Hg_vol_Norm - mHgvN) / sdHgv
+
+# z-score for median shift too
+mMLS <- mean(loc_analyse.raw3$MLS)
+sdMLS <- sd(loc_analyse.raw3$MLS)
+loc_analyse.raw3$MLS_zscore <- (loc_analyse.raw3$MLS - mMLS) / sdMLS
+
+
+# z-score for edema volume
+mEdvN <- mean(loc_analyse.raw3$Ed_vol_Norm)
+sdEdv <- sd(loc_analyse.raw3$Ed_vol_Norm)
+loc_analyse.raw3$Ed_vol_zscore <- (loc_analyse.raw3$Ed_vol_Norm - mEdvN) / sdEdv
+
+
+
+
+```
+
+
+
+
+
+
+```{r boxplot of Hg_vol across state of consciousness (at MRI and at discharge)}
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+```{r elastic-net regularized logistic regression (to determine the best predictors for the model), include=FALSE}
+library(glmnet)
+library(caret)
+
+
+
+## Function to perform the cv glmnet logistic regression nrep times and reports
+## various useful measures.
+ModelEstimate <- function(df, dep_var, indep_var_ix, nrep, type.measure="auc", alpha=1) {
+  conf_matrices <- list()
+  weights_table <- data.frame()
+  log_lambda_mins <- c()
+  type_meas_values <- c()
+  for (i in 1:nrep) {
+  fit <-  cv.glmnet(x=data.matrix(df[,indep_var_ix]), y=as.factor(df[,dep_var]),
+                    family="binomial", type.measure=type.measure, alpha=alpha)
+  
+  weights <- t(coef(fit, s="lambda.min")[,1])
+  weights_table <- rbind(weights_table, weights)
+  
+  # get log(lambda min), find its index, then extact the corresponding type.measure value
+  # using that index
+  log_lambda_mins <- c(log_lambda_mins, log(fit$lambda.min))
+  lambda_ix <- which(fit$lambda == fit$lambda.min)
+  
+  # get the corresponding max type.measure value for lambda min
+  type_val <- fit$cvm[lambda_ix]
+  type_meas_values <- c(type_meas_values, type_val)
+  
+  
+  predvals <- predict(fit, newx=data.matrix(df[,indep_var_ix]), type="class", s="lambda.min")
+  actvals <- as.factor(df[,dep_var])
+  # need to convert the predicted values to factor and specify the levels
+  # because sometimes the model doesn't predict any unconscious patients,
+  # and turning it to a factor allows for the 0-counts to be included.
+  # This is necessary for averaging over all these tables; they need the same dimensions.
+  cm <- table(actvals, predvals=factor(predvals, levels=0:1))
+  conf_matrices[[i]] <- cm
+}
+
+avg_cm <- apply(simplify2array(conf_matrices), c(1,2), mean)
+tot <- sum(avg_cm)
+# percentages/rates of type I and II error
+tp <- avg_cm[2,2]
+tn <- avg_cm[1,1]
+fp <- avg_cm[1,2]
+fn <- avg_cm[2,1]
+act_yes <- sum(avg_cm[1,])
+act_no <- sum(avg_cm[2,])
+
+acc <- (tp + tn) / tot # Accuracy
+miss <- (fp + fn) / tot # Misclassification rate
+typeIerr <- fp / act_yes # Type I error rate (predict yes when actually no)
+spec <- tn / act_yes # Specificity (how often correctly predict no), ie, 1-Type I error
+typeIIerr <- fn / act_no # Type II error rate (predict no when actually yes)
+sens <- tp / act_no # Sensitivity (how often correctly predict yes), ie, 1-Type II error
+null_err <- act_no / tot # null error rate (percent wrong if always predicted the majority class)
+cohen <- acc - null_err # Cohen's Kappa (how well classifier performs compared to chance)
+
+out <- list()
+outv <- c("Accuracy"=acc, "Misclass. rate"=miss, "Type I error"=typeIerr, "Specificity"=spec,
+          "Type II error"=typeIIerr, "Sensitivity"=sens, "Null error"=null_err, "Cohen's kappa"=cohen)
+# put the type.measure value in this first so I can name it whatever 'type.value' is
+out[[1]] <- mean(type_meas_values)
+out[[2]] <- sd(type_meas_values)
+names(out) <- c(paste(type.measure, "_mean", sep=""), paste(type.measure, "_sd", sep=""))
+out$log_lambda_min_mean <- mean(log_lambda_mins)
+out$log_lambda_min_sd <- sd(log_lambda_mins)
+out$confusion_matrix <- avg_cm
+out$Percent_Prediction_Quality <- outv*100
+out$Coefficients <- weights_table
+
+return(out)
+
+
+}
+
+
+
+
+FindBestAlpha <- function(df, dep_var, indep_var_ix, nrep, type.measure, alpha_seq) {
+  auc_means <- c()
+  alphas <- c()
+  for (i in alpha_seq) {
+    alphas <- c(alphas, i)
+    testfit <- ModelEstimate(df, dep_var=dep_var, indep_var_ix=indep_var_ix, 
+                             nrep=nrep, type.measure=type.measure, alpha=i)
+    auc_means <- c(auc_means, testfit$auc_mean)
+    
+    print(paste("alpha =", i))
+    print(paste("mean AUC =", testfit$auc_mean))
+    
+  }
+  names(auc_means) <- alphas
+  ix <- which(auc_means == max(auc_means))
+  
+  return(auc_means[ix])
+  
+}
+
+
+
+
+
+
+
+#### Parameter selection ####
+
+
+# all parameters
+names(loc_analyse.raw3)
+ich_ix <- grep("ICH", names(loc_analyse.raw3))
+ed_ix <- grep("edema", names(loc_analyse.raw3))
+other_ix <- which(names(loc_analyse.raw3) == "Hg_vol_zscore" | names(loc_analyse.raw3) == "MLS_zscore" | 
+                  names(loc_analyse.raw3) == "Ed_vol_zscore" | names(loc_analyse.raw3) == "Old.stroke" |
+                  names(loc_analyse.raw3) == "IVH")
+
+all_ix <- c(ich_ix, ed_ix, other_ix)
+
+#names(loc_analyse.raw3)[c(ich_ix, ed_ix, other_ix)]
+
+
+
+# New method to select columns
+colstouse <- grep("ICH|IVH|\\<MLS_zscore\\>|Hg_vol_zscore|Old.stroke", names(loc_analyse.raw3))  # |!Meso_ICH_2_contro|!Meso_ICH_2_ipsi
+#grep("MRI_Cs2|ICH|IVH|MLS|\\infra_tent\\b|\\supra_tent\\b|Hg_vol_Norm|Old.stroke", names(loc_analyse.raw3))
+#colstouse <- colstouse[!colstouse %in% exclude]
+grep("Meso_ICH_2_ipsi|Meso_ICH_2_contro", names(loc_analyse.raw3[,colstouse]), invert=T)
+
+
+#use_dat <- loc_analyse.raw3[,colstouse]
+loc_analyse.raw3[,c("infra_tent", "supra_tent")] <- lapply(loc_analyse.raw3[,c("infra_tent", "supra_tent")],
+                                                  as.factor)
+
+
+
+
+
+
+#### Analysis using Hg_vol and MLS 
+
+## pick out columns we want
+ich_cols <- grep("ICH", names(loc_analyse.raw3))
+other_cols1 <- which(names(loc_analyse.raw3) == "IVH" | names(loc_analyse.raw3) == "Old.stroke" |
+                    names(loc_analyse.raw3) == "Hg_vol_zscore" |
+                    names(loc_analyse.raw3) == "MLS_zscore")
+
+colstouse_Hgvol_MLS <- c(ich_cols, other_cols1)
+
+
+
+
+
+
+
+#### Analysis leaving out Hg_vol and MLS 
+
+## pick out columns we want
+ich_cols <- grep("ICH", names(loc_analyse.raw3))
+other_cols2 <- which(names(loc_analyse.raw3) == "IVH" | names(loc_analyse.raw3) == "Old.stroke")
+
+colstouse_NO_Hgvol_MLS <- c(ich_cols, other_cols2)
+
+
+
+
+
+
+
+#### Try to also remove the TH and Meso_C subgroups (only keep TH_ICH) 
+
+
+
+#### Leave out TH_subgroups
+TH_nms <- grep("TH", names(loc_analyse.raw3)[colstouse_Hgvol_MLS], value=T)
+rm_ix <- which(TH_nms != "TH_ICH_contro" & TH_nms != "TH_ICH_ipsi")
+rm_ix_nms <- TH_nms[rm_ix]
+TH_ix_to_remove <- which(names(loc_analyse.raw3)[colstouse_Hgvol_MLS] %in% rm_ix_nms)
+
+names(loc_analyse.raw3)[colstouse_Hgvol_MLS][-TH_ix_to_remove]
+
+
+### Remove them for all parameters
+TH_nms2 <- grep("TH", names(loc_analyse.raw3)[all_ix], value=T)
+rm_ix2 <- which(TH_nms2 != "TH_ICH_contro" & TH_nms2 != "TH_ICH_ipsi" & 
+                TH_nms2 != "TH_edema_ipsi" & TH_nms2 != "TH_edema_contro")
+rm_ix_nms2 <- TH_nms2[rm_ix2]
+## This is the good one.
+TH_ix_to_remove2 <- which(names(loc_analyse.raw3)[all_ix] %in% rm_ix_nms2)
+
+#### Add names to the rm_ix_nms2 to remove additional parameters
+new_rm_nms <- c(rm_ix_nms2, "MesoC_ICH_contro", "MesoC_ICH_ipsi", "BS_ICH")
+Extra_ix_to_remove <- which(names(loc_analyse.raw3)[all_ix] %in% new_rm_nms)
+
+
+
+
+#### also leave out the Mesocircuit subgroups and BS_ICH
+TH_to_rm <- c("FCx_ICH_ipsi",  "FCx_ICH_contro", "TH_ICH_ipsi", "TH_ICH_contro", "GP_ICH_ipsi", "GP_ICH_contro", "Caudate_ICH_ipsi",
+"Caudate_ICH_contro", "PUT_ICH_ipsi", "PUT_ICH_contro", "MB_peduncle_ICH_ipsi", "MB_peduncle_ICH_contro", "MB_ICH_C", "Teg_ICH_ipsi",
+"Teg_ICH_contro")
+
+
+
+
+
+# Meso_ix_to_remove <- which(names(loc_analyse.raw3)[colstouse_Hgvol_MLS][-ix_to_remove] %in% c("FCx_ICH_ipsi",
+#   "FCx_ICH_contro",
+# "TH_ICH_ipsi",
+# "TH_ICH_contro",
+# "GP_ICH_ipsi",
+# "GP_ICH_contro",
+# "Caudate_ICH_ipsi",
+# "Caudate_ICH_contro",
+# "PUT_ICH_ipsi",
+# "PUT_ICH_contro",
+# "MB_peduncle_ICH_ipsi",
+# "MB_peduncle_ICH_contro",
+# "MB_ICH_C",
+# "Teg_ICH_ipsi",
+# "Teg_ICH_contro"))
+
+Meso_ix_to_remove <- which(names(loc_analyse.raw3)[colstouse_Hgvol_MLS][-ix_to_remove] %in% c("MesoC_ICH_contro", "MesoC_ICH_ipsi"))
+
+## new way using all parameters
+Meso_ix_to_remove2 <- which(names(loc_analyse.raw3)[all_ix] %in% c("MesoC_ICH_contro", "MesoC_ICH_ipsi", "BS_ICH"))
+
+## Have to do it the same way as TH
+rm_Mesoix2 <- which(names(loc_analyse.raw3)[all_ix] %in% c("MesoC_ICH_contro", "MesoC_ICH_ipsi", "BS_ICH"))
+# rm_Mesoix2 <- which(Meso_nms2 != "TH_ICH_contro" & Meso_nms2 != "TH_ICH_ipsi" & 
+#                 Meso_nms2 != "TH_edema_ipsi" & Meso_nms2 != "TH_edema_contro")
+rm_Mesoix_nms2 <- Meso_nms2[rm_Mesoix2]
+## This is the good one.
+Meso_ix_to_remove2 <- which(names(loc_analyse.raw3)[all_ix] %in% c("MesoC_ICH_contro", "MesoC_ICH_ipsi", "BS_ICH"))
+
+
+
+
+## Just get meso and volumes
+meso_names <- c("FCx_ICH_ipsi", "FCx_ICH_contro", "FCx_edema_ipsi", "FCx_edema_contro",
+                                     "TH_ICH_ipsi", "TH_ICH_contro", "TH_edema_ipsi", "TH_edema_contro",
+                                     "GP_ICH_ipsi", "GP_ICH_contro", "GP_edema_ipsi", "GP_edema_contro",
+                                     "Caudate_ICH_ipsi", "Caudate_ICH_contro", "Caudate_edema_ipsi", "Caudate_edema_contro",
+                                     "PUT_ICH_ipsi", "PUT_ICH_contro", "PUT_edema_ipsi", "PUT_edema_contro",
+                                     "MB_peduncle_ICH_ipsi", "MB_peduncle_ICH_contro", "MB_peduncle_edema_ipsi", "MB_peduncle_edema_contro",
+                                     "MB_ICH_C",
+                                     "Teg_ICH_ipsi", "Teg_ICH_contro", "Teg_edema_ipsi", "Teg_edema_contro",
+                                     "Hg_vol_zscore", "Ed_vol_zscore", "MLS_zscore")
+
+meso_ix <- which(names(loc_analyse.raw3) %in% meso_names)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### Models ####
+
+# With Hg_vol and MLS
+model1 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = colstouse_Hgvol_MLS, nrep = 500, type.measure = "auc")
+
+# Without Hg_vol and MLS
+model2 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = colstouse_NO_Hgvol_MLS, nrep = 500, type.measure = "auc")
+
+# Using only the "summary" parameters for TH and Meso and including Hg_vol and MLS
+# this has the highest AUC
+model3 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = colstouse_Hgvol_MLS[-TH_ix_to_remove], 
+                        nrep = 500, type.measure = "auc")
+
+# Using only the "summary" parameters for TH and Meso and EXCLUDING including Hg_vol and MLS
+# this has the lowest AUC
+model4 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = colstouse_NO_Hgvol_MLS[-TH_ix_to_remove], 
+                        nrep = 500, type.measure = "auc")
+
+
+# 80% AUC
+model5 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-TH_ix_to_remove2], 
+                        nrep = 500, type.measure = "auc")
+
+
+# just model 5, but with alpha=0.3
+model6 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-TH_ix_to_remove2], 
+                        nrep = 500, type.measure = "auc", alpha=0.3)
+
+
+# model6, but removing MesoC_X and and BS_ICH
+model7 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-Extra_ix_to_remove], 
+                        nrep = 500, type.measure = "auc", alpha=0.3)
+
+
+
+
+model8 <- ModelEstimate(loc_analyse.raw3, dep_var = "follow2", indep_var_ix = all_ix[-Extra_ix_to_remove], 
+                        nrep = 500, type.measure = "auc", alpha=0.3)
+
+
+
+# checck if the volumes are still picked as the only important features
+# when using all parameters (ICH + edema) with alpha=1 (LASSO)
+model9 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-Extra_ix_to_remove], 
+                        nrep = 500, type.measure = "auc", alpha=1)
+
+
+
+
+# Just mesocircuit areas and volumes
+model10 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = meso_ix, 
+                        nrep = 500, type.measure = "auc", alpha=0.1)
+
+model10.1 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = meso_ix, 
+                        nrep = 500, type.measure = "auc", alpha=1)
+
+
+
+
+names(loc_analyse.raw3)[all_ix][-TH_ix_to_remove2][-Meso_ix_to_remove2]
+
+
+# plot ROC curve
+fit <-  cv.glmnet(x=data.matrix(df[,indep_var_ix]), y=as.factor(df[,dep_var]),
+                    family="binomial", type.measure=type.measure, alpha=alpha)
+
+lasso.prob <- predict(fit, newx=data.matrix(df[,indep_var_ix]), type="response", s="lambda.min")
+pred <- prediction(lasso.prob, as.factor(df[,dep_var]))
+
+perf <- performance(pred, "tpr", "fpr")
+what <- performance(pred, "auc")
+plot(perf, colorize=F, col="black")
+
+# apparently this NEEDS a formula; can't supply an x and y like in glmnet.
+rc <- roc(as.factor(df[,dep_var]) ~ data.matrix(df[,indep_var_ix]), auc=T, ci=T, na.rm=T)
+
+
+
+
+
+#### Using caret and glmnet to select optimal lambda and alpha ####
+# set lambda and alpha grid
+lambda.grid <- 10^seq(2, -2, length=100)
+alpha.grid <- seq(0, 1, length=10)
+
+# set up cross validation method for train function
+trainCtrl <- trainControl(method = "repeatedCV",
+                          number = 10,
+                          repeats = 5)
+
+
+srchGrd <- expand.grid(.alpha=alpha.grid, .lambda=lambda.grid)
+
+
+
+# my.train <- train(as.factor(df[,dep_var]) ~ ., data=data.matrix(df[,meso_ix]),
+#              method="glmnet",
+#              tuneGrid=srchGrd,
+#              trControl=trainCtrl,
+#              standardize=TRUE, maxit=1000000)
+set.seed(2018)
+my.train <- train(x=data.matrix(df[,all_ix[-Extra_ix_to_remove]]), y=as.factor(df[,dep_var]),
+             method="glmnet",
+             tuneGrid=srchGrd,
+             trControl=trainCtrl,
+             standardize=TRUE, maxit=1000000)
+
+my.train$bestTune
+
+
+
+
+
+
+
+
+
+#names(loc_analyse.raw3)[colstouse_Hgvol_MLS][-TH_ix_to_remove]
+
+
+# which has the highest AUC
+which(c(model1$auc_mean, model2$auc_mean, model3$auc_mean, model4$auc_mean) == 
+        max(c(model1$auc_mean, model2$auc_mean, model3$auc_mean, model4$auc_mean)))
+
+# which has the lowest AUC
+which(c(model1$auc_mean, model2$auc_mean, model3$auc_mean, model4$auc_mean) ==
+        min(c(model1$auc_mean, model2$auc_mean, model3$auc_mean, model4$auc_mean)))
+
+
+
+
+
+
+
+
+#### Testing alpha levels
+
+Testfit3 <-  cv.glmnet(x=data.matrix(loc_analyse.raw3[,all_ix[-TH_ix_to_remove2]]), y=as.factor(df[,"MRI_Cs2"]),
+                    family="binomial", type.measure="auc", alpha=1)
+
+
+
+#### Search through values of alpha for the best AUC ####
+for (i in seq(0, 1, 0.1)) {
+  Testfit2 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-TH_ix_to_remove2], 
+                        nrep = 100, type.measure = "auc", alpha=i)
+  
+  print(paste("alpha =", i))
+  print(Testfit2$auc_mean)
+  
+}
+
+
+
+
+# now it seems like alpha=0.1 is best?
+FindBestAlpha(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = meso_ix, 
+                        nrep = 80, type.measure = "auc", alpha_seq = seq(0, 1, 0.1))
+
+
+FindBestAlpha(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-TH_ix_to_remove2], 
+                        nrep = 80, type.measure = "auc", alpha_seq = seq(0, 1, 0.1))
+
+## Alpha between 0.2 and 0.3 seems the best
+# [1] "alpha = 0"
+# [1] 0.8273624
+# [1] "alpha = 0.1"
+# [1] 0.829356
+# [1] "alpha = 0.2"
+# [1] 0.8322876
+# [1] "alpha = 0.3"
+# [1] 0.8332507
+# [1] "alpha = 0.4"
+# [1] 0.8287533
+# [1] "alpha = 0.5"
+# [1] 0.8274042
+# [1] "alpha = 0.6"
+# [1] 0.8276757
+
+
+# alpha vals between 0.2 and 0.4
+vals <- c("0.2"=0.8270099, "0.21"=0.8304527, "0.22"=0.8315107, "0.23"=0.8346702, "0.24"=0.8302459, "0.25"=0.8317111,
+          "0.26"=0.8299371, "0.27"=0.8346715, "0.28"=0.8315948, "0.29"=0.8312313, "0.30"=0.8330079,
+          "0.31"=0.8303541, "0.32"=0.8308719, "0.33"=0.829765, "0.34"=0.8304543, "0.35"=0.8255403,
+          "0.36"=0.8274506, "0.37"=0.8273007, "0.38"=0.8281617, "0.39"=0.8269777, "0.40"=0.8284687)
+
+qplot(x=as.numeric(names(vals)), y=vals, geom=c("point", "line"))
+
+
+## Alpha = 0.27 seems to be the winner
+# [1] "alpha = 0.27"
+# [1] 0.8346715
+
+# make sure
+## --ok, so the AUC seems to vary slightly even between, like, 0.25 and 0.35,
+## so I guess we could pick 0.3 and be done with it.
+for (i in 1:10) {
+  Testfit3 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-TH_ix_to_remove2], 
+                        nrep = 100, type.measure = "auc", alpha=0.3)
+  
+  print(paste("alpha = 0.30"))
+  print(Testfit3$auc_mean)
+  
+}
+
+
+
+
+
+Testfit2 <- ModelEstimate(loc_analyse.raw3, dep_var = "MRI_Cs2", indep_var_ix = all_ix[-TH_ix_to_remove2], 
+                        nrep = 1, type.measure = "auc")
+
+
+
+
+
+
+
+```
+
+
+
+
+```{r new cv model approach}
+library(caret)
+library(glmnet)
+library(reshape2)
+library(pROC)
+library(ROCR)
+
+
+
+calcConfInt <- function(data) {
+  m    <- mean(data)
+  stdv <- sd(data)
+  n    <- length(data)
+  
+  err  <- qt(0.975, df=n-1) * stdv / sqrt(n)
+  CI.l <- m - err
+  CI.u <- m + err
+  
+  return(c(lower=CI.l, upper=CI.u))
+}
+
+
+
+
+RunModel <- function(data, indep_var_ix, dep_var_vals, n_runs, lambda_grid=NULL, p=0.80, alpha=0.95, nfolds=10, lambda_use="lambda.min") {
+  
+  AUCs <- c()
+  weights_table <- data.frame()
+  probs_table <- as.data.frame(matrix(nrow=nrow(data)))
+  rownames(probs_table) <- rownames(data)
+  for (i in 1:n_runs) {
+    
+    df <- data.matrix(data[,indep_var_ix])
+    # add dependent variable to beginning of table
+    df <- cbind(as.factor(dep_var_vals), df)
+    
+    # create testing/training sets
+    train_ix <- createDataPartition(as.factor(df[,1]), p=p, list=F)
+    train <- df[train_ix,]
+    test <- df[-train_ix,]
+    
+    # run model
+    modfit <- cv.glmnet(x=train[,2:ncol(train)], y=train[,1], lambda=lambda_grid,
+                        family="binomial", type.measure="auc", alpha=alpha, nfolds=nfolds)
+    
+    # then use the lambda min in the regular glmnet function?
+    # modfit <- glmnet(x=train[,2:ncol(train)], y=train[,1], lambda=modfit$lambda.min,
+    #                  family="binomial", alpha=alpha)
+    
+    # get coefficients/weights
+    weights <- t(coef(modfit, s=lambda_use)[,1])
+    weights_table <- rbind(weights_table, weights)
+    
+    # predict using the test data
+    pred.prob <- predict(modfit, newx=data.matrix(test[,2:ncol(test)]),
+                         type="response", s=lambda_use)
+    
+    # save the probabilities for the patients in the current test dataset
+    # using the current row indices of the test table and matching to the
+    # row indices in the main table
+    probs_table <- cbind(probs_table, X=pred.prob[match(rownames(probs_table), rownames(pred.prob))])
+    
+    # predict new values
+    pred <- prediction(pred.prob, test[,1])
+    # get AUC
+    auc <- performance(pred, "auc")
+    # save aucs to vector
+    # 'auc' is an S4 class object; need to extract using '@'
+    AUCs <- c(AUCs, auc@y.values[[1]])
+  }
+  
+  # set first column as row indices for probs_table and reset column names
+  colnames(probs_table) <- as.character(1:length(colnames(probs_table)))
+  probs_table[,1] <- as.numeric(rownames(probs_table))
+  colnames(probs_table)[1] <- "patient"
+  
+  # now melt table and calculate confusion matrix, assigning pred.values < 0.5
+  # as unconscious
+  medProbs <- melt(probs_table, id="patient") %>%
+    group_by(patient) %>%
+    summarize(medProb = median(value, na.rm=T))
+  
+  medProbs$class_vals <- ifelse(medProbs$medProb < 0.5, yes=0, no=1)
+  # order by patient row index, that was the dep_var_vals match up with the same patient
+  # I think this step is unnecessary now that the row-index column is numeric, but w/e
+  medProbs <- medProbs[order(medProbs$patient), ]
+  medProbs$actual_vals <- dep_var_vals
+  cm <- table(actual=medProbs$actual_vals, predict=medProbs$class_vals)
+  
+  # return weights table and AUCs together in a list
+  out <- list(AUC=AUCs, weights=weights_table, probs=probs_table, medProb=medProbs, confus_mat=cm)
+  return(out)
+  
+  
+}
+
+
+
+RunLOOModel <- function(data, indep_var_ix, dep_var_vals, lambda_grid=NULL, p=0.80, alpha=0.95, nfolds=10, lambda_use="lambda.min") {
+  
+  AUCs <- c()
+  weights_table <- data.frame()
+  probs_table <- as.data.frame(matrix(nrow=nrow(data)))
+  rownames(probs_table) <- rownames(data)
+  for (i in 1:nrow(data)) {
+    
+    df <- data.matrix(data[,indep_var_ix])
+    # add dependent variable to beginning of table
+    df <- cbind(as.factor(dep_var_vals), df)
+    
+    # create testing/training sets
+    train <- df[-i,]
+    # need to transpose the matrix because, for SOME REASON,
+    # matrices default to transposing the dimensions when only 1
+    # row is indexed out. So I have to RE transpose it back.
+    test <- t(df[i,])
+    
+    # run model
+    modfit <- cv.glmnet(x=train[,2:ncol(train)], y=train[,1], lambda=lambda_grid,
+                        family="binomial", type.measure="auc", alpha=alpha, nfolds=nfolds)
+    
+    
+    # get coefficients/weights
+    weights <- t(coef(modfit, s=lambda_use)[,1])
+    weights_table <- rbind(weights_table, weights)
+    
+    # predict using the test data
+    pred.prob <- predict(modfit, newx=t(data.matrix(test[,2:ncol(test)])),
+                         type="response", s=lambda_use)
+    
+    # for this function, can just append probabilities to a vector,
+    # since the order of probabilities always refers to the row order of the data table
+    probs_table[i,1] <- pred.prob
+    
+
+  }
+  
+  # set first column as row indices for probs_table and reset column names
+  #colnames(probs_table) <- as.character(1:length(colnames(probs_table)))
+  #probs_table[,1] <- as.numeric(rownames(probs_table))
+  colnames(probs_table)[1] <- "probability"
+  
+  
+  probs_table$class_vals <- ifelse(probs_table$probability < 0.5, yes=0, no=1)
+  # order by patient row index, that was the dep_var_vals match up with the same patient
+  # I think this step is unnecessary now that the row-index column is numeric, but w/e
+  #medProbs <- medProbs[order(medProbs$patient), ]
+  probs_table$actual_vals <- dep_var_vals
+  cm <- table(actual=probs_table$actual_vals, predict=probs_table$class_vals)
+  cm <- confusionMatrix(cm)
+  
+  # Calculate ROC AUC
+  rc <- roc(actual_vals ~ probability, data=probs_table, auc=T, ci=T, na.rm=T)
+  #ci <- ci.thresholds(rc)
+  
+
+  # return weights table and AUCs together in a list
+  #out <- list(AUC=AUCs, weights=weights_table, probs=probs_table, medProb=medProbs, confus_mat=cm)
+  out <- list(AUC=rc, probs=probs_table, confus_mat=cm)
+  return(out)
+  
+  
+}
+
+
+
+
+#### get all parameters ####
+names(loc_analyse.raw3)
+ich_ix <- grep("ICH", names(loc_analyse.raw3))
+ed_ix <- grep("edema", names(loc_analyse.raw3))
+other_ix <- which(names(loc_analyse.raw3) == "Hg_vol_zscore" | names(loc_analyse.raw3) == "MLS_zscore" | 
+                  names(loc_analyse.raw3) == "Ed_vol_zscore" | names(loc_analyse.raw3) == "Old.stroke" |
+                  names(loc_analyse.raw3) == "IVH")
+
+all_ix <- c(ich_ix, ed_ix, other_ix)
+
+
+# remove TH subgroups and MesoC summary params
+TH_nms2 <- grep("TH", names(loc_analyse.raw3)[all_ix], value=T)
+rm_ix2 <- which(TH_nms2 != "TH_ICH_contro" & TH_nms2 != "TH_ICH_ipsi" & 
+                TH_nms2 != "TH_edema_ipsi" & TH_nms2 != "TH_edema_contro")
+rm_ix_nms2 <- TH_nms2[rm_ix2]
+## This is the good one.
+TH_ix_to_remove2 <- which(names(loc_analyse.raw3)[all_ix] %in% rm_ix_nms2)
+
+#### Add names to the rm_ix_nms2 to remove additional parameters
+new_rm_nms <- c(rm_ix_nms2, "MesoC_ICH_contro", "MesoC_ICH_ipsi", "BS_ICH")
+Extra_ix_to_remove <- which(names(loc_analyse.raw3)[all_ix] %in% new_rm_nms)
+
+
+## Just get meso and volumes
+meso_names <- c("FCx_ICH_ipsi", "FCx_ICH_contro", "FCx_edema_ipsi", "FCx_edema_contro",
+                                     "TH_ICH_ipsi", "TH_ICH_contro", "TH_edema_ipsi", "TH_edema_contro",
+                                     "GP_ICH_ipsi", "GP_ICH_contro", "GP_edema_ipsi", "GP_edema_contro",
+                                     "Caudate_ICH_ipsi", "Caudate_ICH_contro", "Caudate_edema_ipsi", "Caudate_edema_contro",
+                                     "PUT_ICH_ipsi", "PUT_ICH_contro", "PUT_edema_ipsi", "PUT_edema_contro",
+                                     "MB_peduncle_ICH_ipsi", "MB_peduncle_ICH_contro", "MB_peduncle_edema_ipsi", "MB_peduncle_edema_contro",
+                                     "MB_ICH_C",
+                                     "Teg_ICH_ipsi", "Teg_ICH_contro", "Teg_edema_ipsi", "Teg_edema_contro",
+                                     "Hg_vol_zscore", "Ed_vol_zscore", "MLS_zscore")
+
+meso_ix <- which(names(loc_analyse.raw3) %in% meso_names)
+
+
+# mesoC without FC
+meso_names2 <- c("TH_ICH_ipsi", "TH_ICH_contro", "TH_edema_ipsi", "TH_edema_contro",
+                                     "GP_ICH_ipsi", "GP_ICH_contro", "GP_edema_ipsi", "GP_edema_contro",
+                                     "Caudate_ICH_ipsi", "Caudate_ICH_contro", "Caudate_edema_ipsi", "Caudate_edema_contro",
+                                     "PUT_ICH_ipsi", "PUT_ICH_contro", "PUT_edema_ipsi", "PUT_edema_contro",
+                                     "MB_peduncle_ICH_ipsi", "MB_peduncle_ICH_contro", "MB_peduncle_edema_ipsi", "MB_peduncle_edema_contro",
+                                     "MB_ICH_C",
+                                     "Teg_ICH_ipsi", "Teg_ICH_contro", "Teg_edema_ipsi", "Teg_edema_contro",
+                                     "Hg_vol_zscore", "Ed_vol_zscore", "MLS_zscore")
+
+meso_ix2 <- which(names(loc_analyse.raw3) %in% meso_names2)
+
+
+
+
+
+#### The 4 main models ####
+## MRI_Cs2 ~ All_Params
+## MRI_Cs2 ~ Mesocircuit
+## follow2 ~ All_Params
+## follow2 ~ Mesocircuit
+
+# all @ MRI
+All_params_MRI <- RunModel(data=loc_analyse.raw3, 
+                           indep_var_ix=all_ix[-Extra_ix_to_remove], 
+                           dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                           n_runs=500)
+
+# mesoC without FC @ MRI
+Meso_MRI <- RunModel(data=loc_analyse.raw3, 
+                     indep_var_ix=meso_ix2, 
+                     dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                     n_runs=500)
+
+
+# all @ Dch
+All_params_Dch <- RunModel(data=loc_analyse.raw3, 
+                           indep_var_ix=all_ix[-Extra_ix_to_remove], 
+                           dep_var_vals=loc_analyse.raw3$follow2,
+                           n_runs=500)
+
+
+# mesoC without FC @ Dch
+Meso_Dch <- RunModel(data=loc_analyse.raw3, 
+                     indep_var_ix=meso_ix2, 
+                     dep_var_vals=loc_analyse.raw3$follow2,
+                     n_runs=500)
+
+
+
+
+
+#### Plots of the 4 models together ####
+histdat <- data.frame(All_params_MRI$AUC,
+                      All_params_Dch$AUC,
+                      Meso_MRI$AUC,
+                      Meso_Dch$AUC)
+
+colnames(histdat) <- gsub(".AUC", "", colnames(histdat))
+
+histdat2 <- melt(histdat)
+
+# histograms are kind of messy, with large or small bin sizes
+ggplot(data=histdat2, aes(x=value, fill=variable)) +
+  geom_histogram(alpha=0.2, position="identity", bins=100) + theme_minimal()
+
+
+# kernel density plots look much nicer than histograms for these data
+ggplot(data=histdat2, aes(x=value, fill=variable)) +
+  geom_density(alpha=0.3, position="identity") + 
+  xlab("AUC") + theme_minimal()
+
+
+# violin plot
+ggplot(data=histdat2, aes(x=variable, y=value, fill=variable)) +
+  geom_violin(alpha=0.7, position="identity") +
+  geom_jitter(height=0, width=0.1, alpha=0.1) +
+  ylab("AUC") + xlab("Model") + theme_minimal() +
+  coord_flip()
+
+
+
+
+#### Confidence Intervals for the 4 models ####
+
+
+calcConfInt(histdat$All_params_MRI)
+calcConfInt(histdat$All_params_Dch)
+calcConfInt(histdat$Meso_MRI)
+calcConfInt(histdat$Meso_Dch)
+
+
+
+
+
+
+
+#### Boxplots of volumes for each conscious state
+volsdat <- dplyr::select(loc_analyse.raw3, MRI_Cs3, Hg_vol_zscore, Ed_vol_zscore, MLS_zscore)
+volsdat2 <- melt(volsdat, id="MRI_Cs3")
+volsdat2$MRI_Cs3 <- as.factor(volsdat2$MRI_Cs3)
+
+ggplot(data=volsdat2, aes(x=MRI_Cs3, y=value, fill=variable)) +
+  geom_boxplot() + ggtitle("Volumes and MLS") + theme_minimal() 
+
+
+
+
+
+
+
+
+
+
+
+
+
+#### model to find best parameters ####
+
+### Do this with just mesoC AND using mesoC WITHOUT "FCx_edema_contro" "FCx_edema_ipsi" "FCx_ICH_contro" "FCx_ICH_ipsi" 
+
+# set values of lambda to use/test
+###### For some reason, it's apparently better to supply your own list of lambdas to test against
+###### instead of letting glmnet generate its own.
+###### And I guess this is apparent when plotting the coefficients from a model
+###### using the default lambdas vs a model with user-specified lambdas.
+lambda_grid <- 10^seq(2, -2, length=100)
+
+
+
+### run model on different subsets of the data and with different parameters
+All_Params_userLambda <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                    n_runs=500, lambda_grid=lambda_grid)
+
+All_Params_defaultLambda <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                    n_runs=500, lambda_grid=NULL)
+
+All_Params_defaultLambda2 <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                    n_runs=500, lambda_grid=NULL)
+# colnames(All_Params_defaultLambda2$probs) <- as.character(1:length(colnames(All_Params_defaultLambda2$probs)))
+# All_Params_defaultLambda2$probs[,1] <- rownames(All_Params_defaultLambda2$probs)
+
+All_Params_defaultLambda_1se <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove],
+                                         dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                                        n_runs=500, lambda_grid=NULL, lambda_use="lambda.1se")
+
+
+All_Params_defaultLambda_useglmnet <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove],
+                                               dep_var_vals=loc_analyse.raw3$MRI_Cs2, n_runs=500, lambda_grid=NULL, lambda_use = "lambda.min")
+
+
+
+# All params with 5,000 runs
+All_Params_5000 <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                    n_runs=5000, lambda_grid=NULL)
+
+
+# using alpha=0
+All_Params_alpha0 <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                                 alpha=0, n_runs=500, lambda_grid=NULL)
+
+
+
+
+
+
+
+### Predicting state at discharge
+All_Params_follow2 <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var_vals=loc_analyse.raw3$follow2,
+                    n_runs=500, lambda_grid=NULL)
+
+
+
+
+
+
+
+# Model with mesoC
+Meso_Model <- RunModel(data=loc_analyse.raw3, indep_var_ix=meso_ix, dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                    n_runs=500)
+
+hist(Meso_Model$AUC, main="MesoC, w/ FC")
+
+
+# Patients who are classified as conscious, but are actually unconscious   at MRI
+missclass <- filter(Meso_Model$medProb, class_vals==1 & actual_vals==0)
+# the conscious status of these patients at discharge
+missclassDchVal <- loc_analyse.raw3[missclass$patient,c("follow2")]
+# add to missclassification table
+missclass <- cbind(missclass, follow2=missclassDchVal)
+### find number of patients whose predicted value of conscious matches a conscious discharge state:
+# there's 19 patients that the model classified as conscious, but were unconscious at MRI and then were conscious at Dch
+trueConscAtDch <- filter(missclass, class_vals==1 & missclassDchVal==1)
+# there's no patients here. I guess that's not bad?
+#trueUnconscAtDch <- filter(missclass, class_vals==0 & missclassDchVal==1)
+
+
+# other way
+missclass2 <- filter(Meso_Model$medProb, class_vals==0 & actual_vals==0)
+missclassDchVal2 <- loc_analyse.raw3[missclass2$patient,c("follow2")]
+missclass2 <- cbind(missclass2, follow2=missclassDchVal2)
+trueConscAtDch2 <- filter(missclass2, class_vals==0 & follow2==0)
+
+
+chisq.test(as.table(matrix(c(13,3,18,19), ncol=2)))
+
+
+
+## the other way around
+missclass2 <- filter(Meso_Model$medProb, class_vals==0 & actual_vals==1)
+# CS state at dch
+missclassDchVal2 <- loc_analyse.raw3[missclass2$patient,c("follow2")]
+# add to missclass table
+# add to missclassification table
+missclass2 <- cbind(missclass2, missclassDchVal2)
+
+
+
+
+
+#### LOO Model
+Meso_LOO <- RunLOOModel(data=loc_analyse.raw3, indep_var_ix = meso_ix2, dep_var_vals = loc_analyse.raw3$MRI_Cs2)
+
+Meso_LOO$AUC
+Meso_LOO$confus_mat
+
+
+
+## Doesn't predict well
+Meso_LOO2 <- RunLOOModel(data=filter(loc_analyse.raw3, MRI_Cs2==0), indep_var_ix = meso_ix2, dep_var_vals = filter(loc_analyse.raw3, MRI_Cs2==0)$follow2, nfolds=5)
+
+Meso_LOO2$AUC
+Meso_LOO2$confus_mat
+
+
+
+# Model with mesoC w/o FC
+Meso_Model2 <- RunModel(data=loc_analyse.raw3, indep_var_ix=meso_ix2, dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                    n_runs=500)
+
+hist(Meso_Model2$AUC, main="MesoC w/o FC")
+
+
+# Model predicting conscious state at discharge instead of at MRI
+Meso_atDch <- RunModel(data=loc_analyse.raw3, indep_var_ix=meso_ix2, dep_var_vals=loc_analyse.raw3$follow2,
+                    n_runs=500, lambda_grid=NULL)
+# colnames(Meso_atDch$probs) <- as.character(1:length(colnames(Meso_atDch$probs)))
+# Meso_atDch$probs[,1] <- rownames(Meso_atDch$probs)
+
+
+
+## Meso Model predicting consciousness at discharge,
+## using only patients who were unconscious at time of MRI
+##### This doesn't seem to work, b/c dataset is now too small.
+Meso_UC.MRI_C.Dch <- RunModel(data=filter(loc_analyse.raw3, MRI_Cs2==0), 
+                              indep_var_ix=meso_ix2, dep_var_vals=loc_analyse.raw3$follow2,
+                              n_runs=500, nfolds=nrow(filter(loc_analyse.raw3, MRI_Cs2==0)))
+
+
+
+confusionMatrix(Meso_Model$confus_mat)
+confusionMatrix(Meso_atDch$confus_mat)
+
+
+## Find optimal alpha
+# using caret
+lambda.grid <- 10^seq(2, -2, length=100)
+alpha.grid <- seq(0, 1, length=10)
+
+# set up cross validation method for train function
+trainCtrl <- trainControl(method = "repeatedcv",
+                          number = 10,
+                          repeats = 5)
+
+srchGrd <- expand.grid(.alpha=alpha.grid, .lambda=lambda.grid)
+
+
+set.seed(2018)
+my.train <- train(x=data.matrix(loc_analyse.raw3[,meso_ix]), y=as.factor(loc_analyse.raw3$MRI_Cs2), #all_ix[-Extra_ix_to_remove]]
+             method="glmnet",
+             tuneGrid=srchGrd,
+             trControl=trainCtrl,
+             standardize=TRUE, maxit=1000000)
+
+my.train$bestTune
+
+
+# using own method
+AvgAUCs <- c()
+alphas <- c()
+for (a in seq(0, 1, 0.1)) {
+  print(paste("alpha:", a))
+  alphas <- c(alphas, a)
+  res <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var_vals=loc_analyse.raw3$MRI_Cs2,
+                    alpha=a, n_runs=500, lambda_grid=NULL)
+  
+  aucvg <- mean(res$AUC)
+  AvgAUCs <- c(AvgAUCs, aucvg)
+  print(paste("mean AUC:", aucvg))
+}
+
+
+
+
+
+#### Histograms
+hist(All_Params$AUC)
+hist(All_Params_defaultLambda_1se)
+hist(All_Params_alpha0$AUC)
+
+hist(All_Params_5000$AUC)
+
+hist(All_Params_userLambda$AUC)
+hist(All_Params_defaultLambda$AUC)
+hist(All_Params_defaultLambda_1se$AUC)
+hist(All_Params_defaultLambda_useglmnet$AUC)
+
+hist(Meso_atDch$AUC)
+
+
+
+##### So it seems like using the 'default' lambda sequence yields more outliers in the coefficients,
+##### but the general trends seem to be the same.
+##### Messing around with using lambda.1se and re-fitting the model using lambda.min from cv.glmnet
+##### don't seem to improve anything.
+
+##### The distribution of the AUCs for all of these models seem to be pretty much the same too.
+
+#### Coefficients
+ggplot(filter(melt(All_Params_userLambda$weights), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + 
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(All_Params_userLambda$weights)$value), max(melt(All_Params_userLambda$weights)$value), by=1), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - User supplied lambda sequence") +
+  coord_flip()
+
+ggplot(filter(melt(All_Params_defaultLambda$weights), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + 
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(All_Params_defaultLambda$weights)$value), max(melt(All_Params_defaultLambda$weights)$value), by=1), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - Default lambda sequence (glmnet generates it)") +
+  coord_flip()
+
+ggplot(filter(melt(All_Params_defaultLambda_1se$weights), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + 
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(All_Params_defaultLambda_1se$weights)$value), max(melt(All_Params_defaultLambda_1se$weights)$value), by=1), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - Default lambda sequence, using lambda.1se") +
+  coord_flip()
+
+ggplot(filter(melt(All_Params_defaultLambda_useglmnet$weights), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + 
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(All_Params_defaultLambda_useglmnet$weights)$value), max(melt(All_Params_defaultLambda_useglmnet$weights)$value), by=1), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - fit model again using glmnet and lambda.min") +
+  coord_flip()
+
+# 5000 times
+ggplot(filter(melt(All_Params_5000$weights), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + 
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(All_Params_5000$weights)$value), max(melt(All_Params_5000$weights)$value), by=1), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - n_runs=5000") +
+  coord_flip()
+
+
+
+## MesoC coefficients w/ and w/o frontal cortex
+ggplot(filter(melt(Meso_Model$weights), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + 
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(Meso_Model$weights)$value), max(melt(Meso_Model$weights)$value), by=5), 1)) +
+  ggtitle("Parameter Coefficients: Mesocircuit") +
+  coord_flip()
+
+ggplot(filter(melt(Meso_Model2$weights), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + 
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(Meso_Model2$weights)$value), max(melt(Meso_Model2$weights)$value), by=5), 1)) +
+  ggtitle("Parameter Coefficients: Mesocircuit - no FC") +
+  coord_flip()
+
+
+
+colnames(All_Params_defaultLambda2$probs)[1] <- "patient"
+
+## Aggragate pred probs by median for each patient
+medProbs <- melt(All_Params_defaultLambda2$probs) %>%
+  group_by(patient) %>%
+  summarize(medProb = median(value, na.rm=T))
+
+
+## Aggragate for predicting consciousness at dch
+colnames(Meso_atDch$probs)[1] <- "patient"
+
+medProbsDch <- melt(Meso_atDch$probs) %>%
+  group_by(patient) %>%
+  summarize(medProb = median(value, na.rm=T))
+  
+
+
+
+
+
+#### Predicted Probabilities per Patient ####
+ggplot(melt(All_Params_defaultLambda2$probs), aes(x=patient, y=value)) +  #reorder(patient, -value)
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  #scale_x_continuous(breaks=round(seq(min(melt(All_Params_defaultLambda2$probs)$value), max(melt(All_Params_defaultLambda2$probs)$value), by=5), 1)) +
+  ggtitle("Predicted Probabilites") +
+  coord_flip()
+
+
+ggplot(medProbs, aes(x=reorder(patient, medProb), y=medProb)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25))
+
+
+# make confusion matrix, using cutoff of 0.5 as conscious v. unconscious
+class_vals <- ifelse(medProbs$medProb < 0.5, yes=0, no=1)
+table(actual=loc_analyse.raw3$MRI_Cs2, predict=class_vals)
+
+# now at discharge
+table(actual_dch=loc_analyse.raw3$follow2, predict=class_vals)
+
+
+
+
+
+## Do this for prediction at dch
+
+
+ggplot(melt(Meso_atDch$probs), aes(x=patient, y=value)) +  #reorder(patient, -value)
+  geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  #scale_x_continuous(breaks=round(seq(min(melt(All_Params_defaultLambda2$probs)$value), max(melt(All_Params_defaultLambda2$probs)$value), by=5), 1)) +
+  ggtitle("Predicted Probabilites at dch - mesoC") +
+  coord_flip()
+
+
+ggplot(medProbsDch, aes(x=reorder(patient, medProb), y=medProb)) +
+  geom_bar(stat="identity") +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25))
+
+
+# make confusion matrix, using cutoff of 0.5 as conscious v. unconscious
+class_vals2 <- ifelse(medProbsDch$medProb < 0.5, yes=0, no=1)
+table(actual=loc_analyse.raw3$follow2, predict=class_vals2)
+
+### Apparently it gets WORSE when using MRI scan to predict unconsciousness at discharge???
+
+
+
+
+# h <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var=loc_analyse.raw3$MRI_Cs2,
+#               pcnt_part=0.80, mod_type="data", n_runs=500, alpha=0.95)
+# 
+# q <- RunModel(data=loc_analyse.raw3, indep_var_ix=all_ix[-Extra_ix_to_remove], dep_var=loc_analyse.raw3$MRI_Cs2,
+#               pcnt_part=0.80, mod_type="hypothesis", n_runs=500, alpha=0.95)
+
+
+
+############# DON'T USE THIS ##################
+#### Hypothesis-driven model to test performance of specific regions
+# n <- 500
+# glmAUCs <- c()
+# for (i in 1:n) {
+#   
+#   df <- loc_analyse.raw3[,meso_ix]
+#   # add MRI_Cs2 to this table
+#   df <- cbind(MRI_Cs2=as.factor(loc_analyse.raw3$MRI_Cs2), df)
+#   
+#   # create testing and training subset
+#   train_ix <- createDataPartition(as.factor(df[,1]), p=0.80, list=F)
+#   train <- df[train_ix,]
+#   test <- df[-train_ix,]
+#   
+#   # find which variables are all the same (either 0 or 1) and remove them
+#   
+#   ###### This is a BIG PROBLEM, since some variables can wind up having only all 0 or 1
+#   ###### after the training/testing splits are created!!!!!
+#   
+#   rm_ix <- c()
+#   for (i in 1:ncol(train[,-1])) {
+#     if (all(train[,-1][i] == 0) | all(train[,-1][i] == 1)) {
+#       rm_ix <- c(rm_ix, i)
+#     }
+#   }
+#   
+#   # create formula
+#   s_form <- paste("MRI_Cs2 ~", paste(names(train[,-1][-rm_ix]), collapse=" + "))
+#   form <- as.formula(s_form)
+#   
+#   # I think there's a problem here since there are ~ 30 parameters still in this.
+#   modfit <- glm(form, data=train, family="binomial")
+#   
+#   ### Now can't use the test data as newdata since it might have 
+#   pred.prob <- predict(modfit, newdata=test[,-1][-rm_ix], type="response")
+#   
+#   ###### Can't predict on the test dataset as 
+#   # "[the] Number of predictions in each run must be equal to the number of labels for each run."
+#   #???????????
+#   pred <- prediction(pred.prob, test[,1])
+#   # Get AUC
+#   auc <- performance(pred, "auc")
+#   # save to vector
+#   # need to extract using '@', since ROCR uses 'S4 classes'
+#   glmAUCs <- c(glmAUCs, auc@y.values[[1]])
+#   # plot ROC curve
+#   #perf <- performance(pred, "tpr", "fpr")
+#   #plot(perf, colorize=F, col="black")
+#   
+# }
+# 
+# hist(glmAUCs)
+
+
+
+
+
+
+
+```
+
+
+
+
+
+
+
+```{r Boxplots of coefficients}
+library(ggplot2)
+library(reshape2)
+
+
+plt1 <- ggplot(melt(model1$Coefficients), aes(x=variable, y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model1$Coefficients)$value), max(melt(model1$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: Including Hg_vol and MLS")
+
+
+
+
+plt2 <- ggplot(melt(model2$Coefficients), aes(x=variable, y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model2$Coefficients)$value), max(melt(model2$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: Excluding Hg_vol and MLS")
+
+
+
+
+plt3 <- ggplot(melt(model3$Coefficients), aes(x=variable, y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model3$Coefficients)$value), max(melt(model3$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: No Subgroups")
+
+
+
+
+plt4 <- ggplot(melt(model4$Coefficients), aes(x=variable, y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model4$Coefficients)$value), max(melt(model4$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: No Subgroups No Hg_vol/MLS")
+
+
+
+
+plt5 <- ggplot(melt(model5$Coefficients), aes(x=variable, y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model5$Coefficients)$value), max(melt(model5$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters")
+
+
+
+#### Can reorder x-axis (or y-axis) values by least to greatest (or vice versa) by using reorder(variable, -/+value) for the x or y variable
+
+## It seems like this did choose a few extra parameters. Most predominantly noticable are the "AntPons_edema" variables.
+plt6 <- ggplot(melt(model6$Coefficients), aes(x=reorder(variable, -value), y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model6$Coefficients)$value), max(melt(model6$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - alpha=0.3") +
+  coord_flip()
+
+
+
+
+plt7 <- ggplot(filter(melt(model7$Coefficients), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model7$Coefficients)$value), max(melt(model7$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - alpha=0.3") +
+  xlab("Parameter") + ylab("Parameter Weight") +
+  coord_flip()
+
+
+
+## using follow2
+plt8 <- ggplot(melt(model8$Coefficients), aes(x=reorder(variable, -value), y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model8$Coefficients)$value), max(melt(model8$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - follow2") +
+  coord_flip()
+
+
+
+
+plt9 <- ggplot(melt(model9$Coefficients), aes(x=reorder(variable, -value), y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model9$Coefficients)$value), max(melt(model9$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: All Parameters - alpha=1") +
+  coord_flip()
+
+
+
+# mesocircuit
+plt10 <- ggplot(filter(melt(model10$Coefficients), variable != "(Intercept)"), aes(x=reorder(variable, -value), y=value)) + geom_boxplot() + theme_bw() +
+  theme(axis.text.x = element_text(angle=90, hjust=1, vjust=0.25)) +
+  scale_y_continuous(breaks=round(seq(min(melt(model10$Coefficients)$value), max(melt(model10$Coefficients)$value), by=0.5), 1)) +
+  ggtitle("Parameter Coefficients: Mesocircuit - alpha=1") +
+  coord_flip()
+  
+
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+```{r Bayes stat test, include = FALSE}
+library(BayesFactor)
+library(MASS)
+
+#table(loc_analyse.raw3$MRI_Cs3)
+table(loc_analyse.raw3$MRI_Cs2)
+#sum(table(loc_analyse.raw3$MRI_Cs3))
+sum(table(loc_analyse.raw3$MRI_Cs2))
+
+### Changed all MRI_Cs3 (0, 1, 2) to MRI_Cs2 (0, 1)
+
+# test BF (need to do a contengency table first)
+bfact<-loc_analyse.raw3[ , c("MRI_Cs2","FCx_ICH_ipsi","TH_ICH_ipsi","GP_ICH_ipsi","Caudate_ICH_ipsi","PUT_ICH_ipsi","MB_peduncle_ICH_ipsi","MB_ICH_C","Teg_ICH_ipsi") ]
+bfact$MRI_Cs2<- as.factor(bfact$MRI_Cs2)
+
+# get a table with the patient identifiers too
+bfact2 <- loc_analyse.raw3[ , c("MRN", "MRI_Cs2","FCx_ICH_ipsi","TH_ICH_ipsi","GP_ICH_ipsi","Caudate_ICH_ipsi","PUT_ICH_ipsi","MB_peduncle_ICH_ipsi","MB_ICH_C","Teg_ICH_ipsi") ]
+
+# with all of the locations
+bfact3 <- loc_analyse.raw3[, c(1,93,3:82,84,96:ncol(loc_analyse.raw3))]  # 93 is MRI_Cs2. 95 is MRI_Cs3
+
+bfact3.c <- data.frame(sapply(bfact3, as.character), stringsAsFactors = FALSE)
+bfact3.n <- data.frame(sapply(bfact3.c, as.numeric))
+
+bfact2.m <- melt(bfact2, id=c("MRN", "MRI_Cs2"))
+bfact2.m$variable <- as.character(bfact2.m$variable)
+
+bfact.c <- data.frame(sapply(bfact, as.character), stringsAsFactors = FALSE)
+bfact.n <- data.frame(sapply(bfact.c, as.numeric))
+#mytable<-xtabs(~FCx_ICH_ipsi+TH_ICH_ipsi+GP_ICH_ipsi+Caudate_ICH_ipsi+PUT_ICH_ipsi+MB_peduncle_ICH_ipsi+MB_ICH_C+Teg_ICH_ipsi+MRI_Cs3,bfact)
+mytable<-xtabs(~FCx_ICH_ipsi+TH_ICH_ipsi+MRI_Cs2,bfact)
+ftable(mytable)
+summary(mytable)  # performs chisq.test(ftable(mytable)) within --actually no, since the summary's chisq results are different than the chisq.test function's.
+contingencyTableBF(mytable, sampleType="indepMulti",fixedMargin = 'cols') # check if indepMulti is correct
+
+table(bfact)
+
+
+### I guess we DO want a table like the above one?
+### the total number of patients in each consciousness group needs to be taken into account.
+### so we basically need an extremely high dimensional contingency table..?
+newtable <- xtabs(~FCx_ICH_ipsi+TH_ICH_ipsi+GP_ICH_ipsi+Caudate_ICH_ipsi+PUT_ICH_ipsi+MB_peduncle_ICH_ipsi+MB_ICH_C+Teg_ICH_ipsi+MRI_Cs2, bfact)
+ftable(newtable)
+sum(newtable)
+summary(newtable)
+
+contingencyTableBF(newtable, sampleType="indepMulti",fixedMargin = 'cols')
+
+
+
+
+
+# Table for CS3 ~ Meso_ICH_2
+tabCS3 <- table(loc_analyse.raw3$Meso_ICH_2_ipsi, loc_analyse.raw3$MRI_Cs3)
+tabfol3 <- table(loc_analyse.raw3$Meso_ICH_2_ipsi, loc_analyse.raw3$follow3)
+
+
+
+#### this thinking might all be wrong b/c we're interested in the dependent Meso
+#### as ordinal, but chisq, fisher, etc. doesn't care about the order.
+
+
+#contingencyTableBF(tabCS3, sampleType="jointMulti")
+# think it should probably be this one
+contingencyTableBF(tabCS3, sampleType="indepMulti", fixedMargin = "cols")
+chisq.test(tabCS3)
+fisher.test(tabCS3, workspace=100000000)
+#contingencyTableBF(tabfol3, sampleType="jointMulti")
+contingencyTableBF(tabfol3, sampleType="indepMulti", fixedMargin = "cols")
+chisq.test(tabfol3)
+fisher.test(tabfol3, workspace=100000000)
+
+
+
+
+
+# with CS2
+tabCS2 <- table(loc_analyse.raw3$Meso_ICH_2_ipsi, loc_analyse.raw3$MRI_Cs2)
+tabfol2 <- table(loc_analyse.raw3$Meso_ICH_2_ipsi, loc_analyse.raw3$follow2)
+
+#contingencyTableBF(tabCS3, sampleType="jointMulti")
+# think it should probably be this one
+contingencyTableBF(tabCS2, sampleType="indepMulti", fixedMargin = "cols")
+chisq.test(tabCS2)
+fisher.test(tabCS2, workspace=100000000)
+#contingencyTableBF(tabfol3, sampleType="jointMulti")
+contingencyTableBF(tabfol2, sampleType="indepMulti", fixedMargin = "cols")
+chisq.test(tabfol2)
+fisher.test(tabfol2, workspace=100000000)
+
+```
+
+```{r Mesocircuit Analysis }
+
+# make boxplot of Meso_ICH_2 and MRI_Cs3/Cs2
+# Cs3
+boxplot(Meso_ICH_2_ipsi ~ MRI_Cs3, data=loc_analyse.raw3, main="MRI Conscious Level", ylab="Meso_ICH_ipsi")
+# Cs2
+boxplot(Meso_ICH_2_ipsi ~ MRI_Cs2, data=loc_analyse.raw3, main="MRI Consciousness Level", ylab="Meso_ICH_ipsi")
+# follow3
+boxplot(Meso_ICH_2_ipsi ~ follow3, data=loc_analyse.raw3, main="Follow at Discharge", ylab="Meso_ICH_ipsi")
+# follow2
+boxplot(Meso_ICH_2_ipsi ~ follow2, data=loc_analyse.raw3, main="Follow at Discharge", ylab="Meso_ICH_ipsi")
+
+table(loc_analyse.raw3$follow3)
+table(loc_analyse.raw3$follow2)
+
+
+# t tests
+print("t test for follow (2 level)")
+t.test(Meso_ICH_2_ipsi ~ follow2, data=loc_analyse.raw3)
+print("t test for MRI CS (2 level")
+t.test(Meso_ICH_2_ipsi ~ MRI_Cs2, data=loc_analyse.raw3)
+
+# anova for 3-group
+fitaov <- aov(Meso_ICH_2_ipsi ~ as.factor(MRI_Cs3), data=loc_analyse.raw3)
+print("ANOVA for MRI CS (3 groups)")
+summary(fitaov)
+TukeyHSD(fitaov)
+
+# follow
+fitaovFol <- aov(Meso_ICH_2_ipsi ~ as.factor(follow3), data=loc_analyse.raw3)
+print("ANOVA for follow (3 groups)")
+summary(fitaovFol)
+TukeyHSD(fitaovFol)
+
+
+
+## Add the Meso_ipsi and Meso_contro together
+loc_analyse.raw3$Meso_ICH_2_sum <- loc_analyse.raw3$Meso_ICH_2_ipsi + loc_analyse.raw3$Meso_ICH_2_contro
+
+boxplot(Meso_ICH_2_sum ~ MRI_Cs3, data=loc_analyse.raw3, main="MRI Conscious Level", ylab="Meso_ICH_sum")
+
+fitaovSum <- aov(Meso_ICH_2_sum ~ as.factor(MRI_Cs3), data=loc_analyse.raw3)
+print("ANOVA for MRI CS (3 groups; Meso ICH ipsi and contro sum")
+summary(fitaovSum)
+TukeyHSD(fitaovSum)
+
+
+# follow2 w/ sum
+boxplot(Meso_ICH_2_sum ~ follow2, data=loc_analyse.raw3, main="Follow at Discharge", ylab="Meso_ICH_sum")
+boxplot(Meso_ICH_2_sum ~ MRI_Cs2, data=loc_analyse.raw3, main="MRI Conscious Level", ylab="Meso_ICH_sum")
+
+print("t test for follow (2 level); Meso sum")
+t.test(Meso_ICH_2_sum ~ follow2, data=loc_analyse.raw3)
+
+print("t test for CS (2 level); Meso sum")
+t.test(Meso_ICH_2_sum ~ MRI_Cs2, data=loc_analyse.raw3)
+
+
+
+
+
+
+
+```
+
+
+
+
+
+```{r Reformat Data Attempt}
+#newTable <- data.frame(MRI_Cs=NULL, lesLoc=NULL)
+
+MRNvec <- NULL
+CSvec <- NULL
+lesLocvec <- NULL
+MRNs <- unique(bfact2.m$MRN)  # same number of rows in bfact/bfact2
+regions <- unique(bfact2.m$variable)  # same number of columns of regions in bfact/bfact2
+
+for (i in 1:length(MRNs)) {
+  #for (j in 1:length(regions)) {
+    #tmp <- filter(bfact2.m, MRN==MRNs[i] & variable==regions[i])
+    # tmp w/ all regions
+    tmp <- filter(bfact2.m, MRN==MRNs[i])
+    # filter where value==1
+    lescheck <- filter(tmp, value==1)
+
+
+    if (length(lescheck$variable)==0) {
+      #MRNtoadd <- rep(MRNs[i], 1)
+      MRNtoadd <- unique(tmp$MRN)
+      CStoadd <- unique(tmp$MRI_Cs2)
+      lesLoctoadd <- "noLesion"
+
+      MRNvec <- c(MRNvec, MRNtoadd)
+      CSvec <- c(CSvec, CStoadd)
+      lesLocvec <- c(lesLocvec, lesLoctoadd)
+
+    } else {
+      #MRNtoadd <- rep(MRNs[i], nrow(lescheck))
+      MRNtoadd <- lescheck$MRN
+      CStoadd <- lescheck$MRI_Cs2
+      lesLoctoadd <- lescheck$variable
+
+      MRNvec <- c(MRNvec, MRNtoadd)
+      CSvec <- c(CSvec, CStoadd)
+      lesLocvec <- c(lesLocvec, lesLoctoadd)
+
+    }
+
+
+    # check if this patient has no lesions
+    # all(tmp$value==0) {
+    #   MRNtoadd <- c(MRNtoadd, MRNs[i])
+    #   lesLoctoadd <- c(lesLoctoadd, "noLesion")
+      #newTable[nrow(newTable)+1,] <- c(MRN=MRNs[i], lesLoc="noLesion")
+      #newTable <- rbind(newTable, toAdd)
+    #}
+  #}
+}
+
+# now bind the two columns
+newTable <- data.frame(MRN=MRNvec, consState=CSvec, lesLoc=lesLocvec)
+
+# just a test to see if modeling with all categorical is possible.
+#fit <- glm(consState ~ lesLoc, data=newTable, family="binomial")
+# not sure what should have a negative effect or a positve one.
+# an ordinal regression on the original-formatted-data has
+# a lot more of these with a negative effect,
+# while this one with the newly-formatted-data has
+# more of them with a positive effect.
+fit <- polr(as.factor(consState) ~ lesLoc, data=newTable, Hess=T)
+# this model does even worse than the other pls one.
+#fit <- plsr(consState ~ lesLoc, data=newTable, validation="CV")
+summary(fit)
+
+
+# for some reason, a chisq test on THIS contingency table has a "better" p-value than the
+# 'counts2' table I made below
+# ...even though they're effectively the same.
+# maybe somethings secretly messed up with counts2?
+newFreqTable <- table(newTable[,-1])
+chisq.test(newFreqTable)
+fisher.test(newFreqTable, workspace=100000000)  # this eventually spits out a p-value of 0.06292
+
+
+# still is not significant here. want a large bayes factor number.
+# although is it still ok to do this when factors are correlated with each other?
+contingencyTableBF(newFreqTable, sampleType="indepMulti",fixedMargin = 'rows')
+
+
+
+
+#### Taking total number of patients in each group into account (NEVER MIND; CAN'T DO THIS)####
+
+# ..do I just need to melt this table.
+### I think THIS takes the total number of patients in each group into account.
+bfact.m <- melt(bfact, id="MRI_Cs3")
+
+newcount <- bfact.m %>%
+  group_by(MRI_Cs3, variable) %>%
+  count(value)
+
+#wrong <- bfact.m %>% group_by(MRI_Cs3, variable) %>% count(variable)
+
+# this sums all the counts for 0 and 1 for each vatriable for each consc stat.
+# want it to just sum all the 1s though
+# ......but then if I do that, I lose the total number per group.
+newcount.noZero <- filter(newcount, value != 0)
+newtable <- xtabs(n ~ variable + MRI_Cs3, data=newcount)
+
+# ...I don't think this is possible.
+# never mind maybe it is:
+
+### This newtable is wrong. Can make one that has consstat at top, and then the locations on the side,
+### and has counts for how many patients had a lesion there. Also include a "location" for "no lesion"
+### which will then account for all patients in each consstat group
+# this has counts of how many 0s and 1s for each region
+generalTable <- table(bfact.m)
+# want to take the table for 1s and then transpose it to have the consstat at the top
+lesionTable <- t(generalTable[,,2])
+
+# can take this (which has total number of patients overall):
+totpats <- (t(table(bfact.m)[,,1])+lesionTable)[1,]
+# rbind the total numbers (20, 25, 80) to the bottom,
+# then just subtract the sum of all the other column values:
+totwlesion <- colSums(lesionTable)
+# from this total to get the number of patients without a lesion
+# for each group?
+#### wait this won't work either, since a single patient can have lesions in multiple areas,
+#### meaning the colSums count patients multiple times.
+
+
+
+### ok, what if 3 seperate tests are done--for each conscstat
+unconsc <- bfact.n[bfact.n$MRI_Cs3==0,]
+vs <- bfact.n[bfact$MB_ICH_C.n==1,]
+consc <- bfact.n[bfact.n$MRI_Cs3==2,]
+
+table(unconsc)
+
+```
+
+
+```{r Ordinal Regression (have to figure out what to do with the multicolinearity) }
+### I'm not sure we can even to a regression on the data, because removing any single
+### correlated variable completely changes the results.
+### and the results are different depending on the variables used.
+library(MASS)
+library(corrplot)
+
+
+# FCx_ICH_ipsi is 0 for all groups, so removing from analysis
+ordfit <- polr(as.factor(MRI_Cs3) ~ TH_ICH_ipsi + GP_ICH_ipsi * Caudate_ICH_ipsi + PUT_ICH_ipsi + MB_peduncle_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi, data=loc_analyse.raw3,
+               Hess=T)
+
+summary(ordfit)
+
+## can get approximate p-values by testing the resulting t-values against the standard normal distribution
+# save results to table
+ctable <- coef(summary(ordfit))
+# calculate p-values (based on Inf DoF..)
+p <- pnorm(abs(ctable[,"t value"]), lower.tail=F)*2
+# add to results
+ctable <- cbind(ctable, "p value" = p)
+
+
+# nothing is significant. probablly due to the colinearity!
+# find which are correlated again and remove them. or assign interactions. idk.
+cormat <- cor(bfact.n[,-c(1,2)])
+corrplot::corrplot(cormat, method="number")
+
+
+# remove stuff from model and see results
+ordfit2 <- polr(MRI_Cs3 ~ TH_ICH_ipsi  * Caudate_ICH_ipsi +  MB_peduncle_ICH_ipsi+ PUT_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi, data=bfact,
+               Hess=T)
+
+summary(ordfit2)
+
+# if GP_[etc] is removed, the TH_[etc] goes from -0.44 to 0.30
+# if PUT_ is removed, TH_ goes from -0.44 to -0.41
+## i.e., the coefficients vary wildly depending on what parameters are used in the model.
+
+```
+
+
+```{r Correspondence Analysis}
+## "tutorial" at https://www.zoology.ubc.ca/~schluter/R/multivariate/
+## not too sure how useful this is.
+library(MASS)
+library(dplyr)
+library(tidyr)
+
+xtabs( ~ MRI_Cs3 + FCx_ICH_ipsi, data=loc_analyse.raw3)
+
+xtabs(FCx_ICH_ipsi ~ TH_ICH_ipsi ~ MRI_Cs3   , data=loc_analyse.raw3)
+
+# can't do on 3D table.
+# but apparently the data is supposed to be columns for each category, and rows for each site
+#z <- corresp(ftable(mytable))
+z <- corresp(counts2)
+
+plot(z)
+
+xtabs(~MRI_Cs3)
+
+# summary table of number of presences for each region for each consciousness state
+counts <- bfact.n %>%
+  group_by(MRI_Cs3) %>%
+  summarise_all(funs(sum))
+  #summarise_each(funs(sum))
+counts2 <- as.data.frame(counts)[,-c(1,2)]  # removes the column of the consciousness group numbers and for the
+# brain region with 0 counts for any of the conscious groups (FCx_ICH_ipsi)
+
+### Need to incorporate the total number of patients in each consciousn group too, not just the overall total where a lesion was found
+# newcount <- bfact %>%
+#   group_by(MRI_Cs3) %>%
+#   count(TH_ICH_ipsi)
+
+xtabs(n ~ TH_ICH_ipsi + MRI_Cs3, newcount)
+
+
+
+
+# can't have a category with all 0 counts in the table (FCx_ICH_ipsi isn't present for any conscious group)
+# so remove FCx_ICH_ipsi from the table
+z <- corresp(counts2, nf=2)
+
+## ...maybe can do chi square type things with THIS table?
+## add in the group names as rownames though
+rownames(counts2) <- as.table(as.data.frame(counts)[,1])
+counts2 <- as.table(as.matrix(counts2))
+chisq.test(counts2)
+# ...not significant.
+
+
+# the bayes factor contengcy table test with THIS table instead?
+### This seems good???
+contingencyTableBF(counts2, sampleType = "indepMulti", fixedMargin = "rows")
+
+
+
+```
+
+
+
+```{r Cochran-Armitage test attempt }
+library(DescTools)
+
+# apparently can't have nested factor groups in the frequency table for this test
+# which is ...unfortunate.
+# also needs to be 2x[number] table. we have 3x[number]
+testTab <- table(loc_analyse.raw3$FCx_ICH_ipsi, loc_analyse.raw3$MRI_Cs3)
+# would have to analyze each factor seperately? that seems wrong.
+CochranArmitageTest(testTab, alternative = "two.sided")
+CochranArmitageTest(newFreqTable, alternative = "two.sided")
+
+
+# Fisher's exact test on this 3-way table works
+fisher.test(ftable(mytable))
+# ...except this is a bad test to use here. Fisher test apparently should only be used on 2x2 tables.
+
+# oh, data being correlated violates the assumptions of the chisq test, so it is also a bad test to use here.
+
+```
+
+
+
+
+
+```{r logistic regression attempt (UPDATE: correlated factors/multicolinearity might not be an issue}
+### NEVER MIND. If the consciousness outcome is actually supposed to have 3 levels, then can't do logistic regression anyway.
+# do model formula like:
+# MRI_Cs3 ~ FCx_ICH_ipsi + TH_ICH_ipsi
+# and make this a logistic regression
+### Should probably be ordinal logistic regression
+### since have more than 2 factors in the response (0, 1, 2)
+### and also the order of these numbers is meaningful.
+fit <- glm(MRI_Cs3 ~ FCx_ICH_ipsi + TH_ICH_ipsi, data=bfact, family="binomial")
+# all parameters. find out which are correlated? ..is it every parameter with one another? i.e., all of them?
+# check correlation via pairwise scatterplot
+#ggpairs(bfact, columns=3:ncol(bfact), lower=list(continuous=AddFitstoPlot))
+# check correlation via correlation matrix
+#bfact.n <- data.frame(sapply(bfact, as.numeric))
+
+library(corrplot)
+cormat <- cor(bfact.n)
+corrplot(cormat, method="number")
+
+# no interactions
+fit <- glm(MRI_Cs2 ~ FCx_ICH_ipsi + TH_ICH_ipsi + GP_ICH_ipsi + Caudate_ICH_ipsi + PUT_ICH_ipsi + MB_peduncle_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi, data=bfact, family="binomial")
+
+summary(fit)
+
+# er.. ok. if I check the Variance Inflation Factors for each independent variable, they aren't that big?
+# ..even though the correlations can be as high as 0.7..? having low VIFs is good though.
+### Does this possibly mean that multicolinearity isn't an issue here?
+### Although I'm not too sure, because if you remove a variable from the regression, the coeficients of the others
+### change, which shouldn't happen.
+VIF(fit)  # this VIF function from the DescTools package gives the same result as car::vif()
+
+# "large" interactions based off of correlation plot
+fit <- glm(MRI_Cs3 ~ FCx_ICH_ipsi + TH_ICH_ipsi + GP_ICH_ipsi*PUT_ICH_ipsi + Caudate_ICH_ipsi + MB_peduncle_ICH_ipsi*MB_ICH_C + MB_peduncle_ICH_ipsi*Teg_ICH_ipsi + MB_ICH_C*Teg_ICH_ipsi, data=bfact, family="binomial")
+
+summary(fit)
+
+
+
+# so far, it looks like including these interaction terms increases the individual significance of the 3 factors that are significant in both models.
+# but wait, having correlated independnt variables IS bad.
+# Apparently you can get around this issue of multicolinearity with PLS regression,
+# but a PLS model doesn't seem to be working too well below..
+
+# testing to see what the coeficients are like when leaving out one of the highly correlated parameters
+fit <- glm(MRI_Cs3 ~ PUT_ICH_ipsi, data=bfact, family="binomial")
+summary(fit)
+
+```
+
+
+
+
+
+```{r Logistic Regression with 5 parameters / univariate logistic regression analyses}
+
+
+runUnivariateRegress <- function(table, depen_vars, indep_vars) {
+  
+  output_table <- data.frame()
+  
+  dep <- paste(depen_vars)
+  response <- paste("cbind(",dep,") ~ ", sep="")
+  
+  for (i in 1:length(indep_vars)) {
+    
+    # see if cbinding a single variable is the same as supplying just the variable. I think it is
+    
+    effect <- paste(indep_vars[i])
+    
+    formula <- paste(response, effect, sep="")
+    form <- as.formula(formula)
+    
+    fit <- try(glm(form, family=binomial, data=table), silent=F)
+    if (class(fit) == "try-error") {
+      message(paste("variable", indep_vars[i]," has error"))
+      return(NA)
+    }
+    smry <- summary(fit)
+    
+    params <- try(matrix(smry$coefficients[2,], nrow=1, ncol=length(smry$coefficients[2,]), byrow=T), silent=T)
+    # add the confidence intervals, but first check if model was able to be fit for this independent variable.
+    if (class(params) != "try-error") {
+      params <- matrix(c(params, c(confint(fit)[2,])), nrow=1)
+      colnames(params) <- c(colnames(smry$coefficients), paste("CI", colnames(confint(fit))))
+      rownames(params) <- rownames(smry$coefficients)[2]
+      
+      output_table <- rbind(output_table, as.data.frame(params))
+    } else {
+      params <- matrix(c(rep(NA, length(output_table))), nrow=1)
+      # I think this will break if the very first row to be added has NAs/is a try-error, since then there'll be no colnames/rownames to choose from.
+      colnames(params) <- colnames(output_table)
+      rownames(params) <- effect
+      output_table <- rbind(output_table, as.data.frame(params))
+    }
+    
+    
+  }
+  
+  # mark p < 0.05 w/ star
+  output_table$`Pr(>|z|)` <-  round(output_table$`Pr(>|z|)`, digits=3)
+  output_table$`Pr(>|z|)` <-  ifelse(output_table$`Pr(>|z|)` < 0.05, yes=paste(output_table$`Pr(>|z|)`, "*"), no=output_table$`Pr(>|z|)`)
+  
+  
+  return(output_table)
+  
+  
+  
+}
+
+logfit <- glm(MRI_Cs2 ~ Hg_vol + MesoC_ICH_ipsi + IVH + Old.stroke + Old.ICH, data=loc_analyse.raw3, family=binomial)
+summary(logfit)
+
+justVol <- glm(MRI_Cs2 ~ Hg_vol, data=loc_analyse.raw3, family=binomial)
+summary(justVol)
+
+# Checking outlier patient with large Hg_vol
+ix <- which(loc_analyse.raw3$Hg_vol==max(loc_analyse.raw3$Hg_vol, na.rm=T))
+loc_analyse.raw3[ix,c("MRN", "Hg_vol", "MRI_date_Loc")]
+
+
+# Check midline shift on patients with a supra_tent lesion (R or L) (then also try R L and Both)
+MLSdat <- filter(loc_analyse.raw3, supra_tent=="R" | supra_tent=="L")
+justMLS <- glm(MRI_Cs2 ~ MLS, data=MLSdat, family=binomial)
+summary(justMLS)
+# with all patients
+justMLSall <- glm(MRI_Cs2 ~ MLS, data=loc_analyse.raw3, family=binomial)
+summary(justMLSall)
+
+# exclude parameters that are all 0
+exclude <- NULL
+for (i in 1:length(names(loc_analyse.raw3))) {
+  if (all(loc_analyse.raw3[,i]==0, na.rm=T)) {
+    exclude <- c(exclude, i)
+  }
+}
+
+out_tab_CS <- runUnivariateRegress(loc_analyse.raw3, "MRI_Cs2", names(loc_analyse.raw3)[-c(1,exclude,84:97)])
+out_tab_fol <- runUnivariateRegress(loc_analyse.raw3, "follow2", names(loc_analyse.raw3)[-c(1,exclude,84:97)])
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r PLS regression attempt (to deal with the multicolinearity of the predictors) }
+# this might look a bit better now?
+# It improved a bit.
+# I believe I was also mistaken about the differences
+# between the % variance explained from summary()
+# and the values from explvar(), which I've documented below.
+# Spoiler: the explvar() numbers aren't percentages.
+
+### Does it even make sense to use binary dependent variables
+### to predict a multi-level independent variable?
+
+### MAYBE we could turn the 3-level outcome into a 2-level one,
+### and then run a logistic-partial-least-squares regression
+### (which is apparently doable in the plsRglm package with the function plsRglm).
+### Because I'm NOT sure if an ordinal-partial-least-squares regression is a thing.
+
+# Maybe should choose a different cross-validation method?
+library(pls)
+library(DiscriMiner)
+
+bfact.c <- data.frame(sapply(bfact, as.character), stringsAsFactors = FALSE)
+bfact.n <- data.frame(sapply(bfact.c, as.numeric))
+# split data into test and train (I guess the row order is "random" enough?)
+train <- bfact.n[1:101, ]
+test <- bfact.n[102:nrow(bfact.n), ]  # leave out ~20% of the data for testing
+# training data
+datTrainY <- train$MRI_Cs3
+
+# fit model (if don't specify ncomp, it will use the maximum number of components possible)
+plsfit <- plsr(MRI_Cs2 ~ FCx_ICH_ipsi + TH_ICH_ipsi + GP_ICH_ipsi + Caudate_ICH_ipsi + PUT_ICH_ipsi + MB_peduncle_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi, data=train, validation="CV")
+summary(plsfit)
+
+
+######## fit PLS model with more predictors #########
+vars <- names(bfact3)[!names(bfact3)=="MRN" & !names(bfact3)=="MRI_Cs3" & !names(bfact3)=="MRI_Cs2"  & !names(bfact3)=="sf_hern" & !names(bfact3)=="Old stroke" & !names(bfact3)=="Uncal herniation (to which side)" & !names(bfact3)=="Transtentorial herniation" & !names(bfact3)=="Cerebellar tonsillar herniation" & !names(bfact3)=="MLS [mm]" & !names(bfact3)=="Old ICH" & !names(bfact3)=="follow" ]  #
+
+# exclude parameters that are always 0
+exclude <- NULL
+for (v in vars) {
+  if (all(bfact3.n[,v]==0)) {
+    exclude <- c(exclude, v)
+  }
+}
+
+onlyone <- NULL
+for (i in 3:ncol(bfact3.n)) {
+  tab <- table(bfact3.n[,i])
+}
+
+vars2 <- vars[!vars %in% exclude]
+
+form <- as.formula(paste("MRI_Cs3 ~", paste(vars, collapse="+")))
+plsfit2 <- plsr(form, data=bfact3.n, validation="CV")
+summary(plsfit2)
+explvar(plsfit2)  # or are these the ACTUAL variances?
+
+plot(RMSEP(plsfit2), legendpos = "topright")
+
+#### Things I just realized ####
+#........the % variance explained is actually 14%. not 94%.
+
+#### Doing some testing, I realized that this was analyzing the consciousness numbers (0, 1, 2) as continuous values, which is bad.
+#### I tried running it on the numbers as characters (because this just tries to auto-convert factors to numeric),
+#### but then this gives an error stating there can't be more than 2 outcomes, which is a problem.
+#### ...Is it possible we can change the 3-level conscious status to a binary outcome of conscious/unconscious?
+### OR IS IT POSSIBLE TO DO THIS ON A CATEGORICAL OUTCOME??
+### https://academic.oup.com/bib/article/8/1/32/265330 UNDER 'OUTLOOK AND GENERALIZAZTIONS OF PLS'
+plsfitNoTest <- plsr(MRI_Cs3 ~ FCx_ICH_ipsi + TH_ICH_ipsi + GP_ICH_ipsi + Caudate_ICH_ipsi + PUT_ICH_ipsi + MB_peduncle_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi, data=bfact.c, validation="CV")
+summary(plsfitNoTest)
+predict(plsfitNoTest)
+# NOT using the leave-one-out cross-validation (validation="LOO") seems a little better..
+# summary of the linear fit of the linear transformation of data to components
+summary(lm(plsfit))
+# None of these are significant.
+# and the R squared here is very low, compared to the higher % variance stated to be explained by the pls model itself.
+
+```
+
+
+```{r Perform a PLS Discriminatory Analysis instead on the binary outcome}
+## Because the dependent variable is not continuous / is categorical 
+
+plsDAfit <- plsDA(variables=train[,2:9], group=as.factor(train$MRI_Cs2), autosel=F, comps=2)
+# what if run on whole dataset and not just the training set? This model can't make predictions?
+plsDAfit2 <- plsDA(variables=bfact.n[,2:9], group=as.factor(bfact.n$MRI_Cs2), autosel=F, comps=10) # not sure how much changing num components matters?
+
+# run using all of the parameters
+# using pre-pulled var names from before, and removing MRI_Cs2 from them
+plsDAfit3 <- plsDA(variables=bfact3.n[,names(bfact3.n) %in% vars2], group=as.factor(bfact3.n$MRI_Cs2), autosel=F, comps=10)
+
+# works with 1:3 variables.
+plsDAfit4 <- plsDA(variables=bfact3.n[,names(bfact3.n) %in% vars2][c(1:33, 35:55)], group=as.factor(bfact3.n$MRI_Cs2), autosel=F, comps=10,
+                   validation="learntest", learn=c(26:125), test=c(1:25))  # learn=learnInd, test=testInd)#
+############ This can give an error if one of the learn or test datasets winds up only having a single 1 or 0 in it for any given column.
+############ The results from testing on different subsets of 20% of the data can yield slighlty better or worse predictions
+############ depending on how different this 20% subset is from the rest of the data....
+plsDAfit4$error_rate
+
+# what if train/test on entire dataset?
+# ...this is the same as not doing a validation at all.
+plsDAfit5 <- plsDA(variables=bfact3.n[,names(bfact3.n) %in% vars2][c(1:33, 35:55)], group=as.factor(bfact3.n$MRI_Cs2), autosel=F, comps=10,
+                   validation="learntest", learn=c(1:125), test=c(1:125))
+
+plsDAfit5$error_rate
+plsDAfit5$confusion
+plot(plsDAfit5)
+
+
+
+
+# cross-validation
+# testIndex <- round(runif(round(nrow(bfact3.n)*0.2), min=0, max=nrow(bfact3.n)))
+# learnIndex <- (1:nrow(bfact3.n))[!1:nrow(bfact3.n) %in% testIndex]
+
+learnInd <- sample(1:nrow(bfact3.n), size=nrow(bfact3.n)-round(nrow(bfact3.n)*0.2))
+testInd <- c(1:nrow(bfact3.n))[!c(1:nrow(bfact3.n)) %in% learnInd]
+
+data <- bfact3.n[,names(bfact3.n) %in% vars2]
+data$MRI_Cs2 <- as.factor(data$MRI_Cs2)
+
+# the below isn't working. get error "missing value where T/F needed"
+# try only using the few variables from before.
+#FCx_ICH_ipsi + TH_ICH_ipsi + GP_ICH_ipsi + Caudate_ICH_ipsi + PUT_ICH_ipsi + MB_peduncle_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi
+data2 <- data[,c("MRI_Cs2", "FCx_ICH_ipsi", "TH_ICH_ipsi", "GP_ICH_ipsi", "Caudate_ICH_ipsi", "PUT_ICH_ipsi", "MB_peduncle_ICH_ipsi", "MB_ICH_C", "Teg_ICH_ipsi")]
+
+
+plsDAfit6 <- plsDA(variables=data2[,2:ncol(data2)], group=data2$MRI_Cs2,
+                   validation="learntest", learn=c(1:100), test=c(101:125))
+
+
+
+# this is meaningless? it looks the same from a plsDA fit on the iris test data.
+#summary(plsDAfit)
+# there's a description of all the components to the model if you just print the model variable (plsDAfit)
+plsDAfit$confusion  # this isn't awful;
+plsDAfit3$confusion  # it improves when all parameters used.
+plsDAfit$error_rate
+plsDAfit3$error_rate  # error rate improves too
+plot(plsDAfit)  # I *think* this shows that legions are not associated with consciousness state == 1?
+plot(plsDAfit3)
+plsDAfit3$R2  # these aren't too good... maybe they can be improved?
+plsDAfit$VIP
+plsDAfit3$Q2
+
+# I don't think DA works unless Y is categorical and X is continuous.
+#doesntwork <- plsDA(variables=iris[,1:4], group=iris$Species)
+
+# predict?
+pls.pred <- predict(plsfit, train, ncomp=5)
+
+# plot the root mean squared error of prediction (RMSEP)
+plot(RMSEP(plsfit), legendpos = "topright")
+# this seems to show that ncomp should = 1, since that would have the lowest RMSEP
+
+# plot the prediction plot
+plot(plsfit, ncomp = 5, line = TRUE)
+# why does the line look like it doesn't fit the points at all oh is it the ncomp?
+# ...it still doesn't look like it accurately goes through the data.
+# ..I think that was because I had "asp = 1" as an argument in plot?
+# which changed the aspect ratio of how it was viewed.
+
+# score plot for the component
+plot(plsfit, plottype = "scores", comps = 5)
+# ...is this good?
+
+# explained variance (apparently NOT the percent explained variance.)
+explvar(plsfit)
+# these numbers are pretty bad... Maybe just need to tweek parameters in the pls regression...?
+### also, why are these % variances different from summary(plsfit)???
+### ...............are these the ACTUAL variance values and not the percent of them explained????
+# if so, THAT'S why they're different and so much lower.
+
+
+### Maybe can do a Cochran-Armitage test, which is basically a chi sq test that works better when the dependent variable is ordinal (conscious status, in this case, with 3 levels)
+## BUT, I'm not sure if this can work with the 2x2x3 setup we have here
+## (FCx_ICH_ipsi x TH_ICH_ipsi x MRI_Cs3)
+## ..although, I guess a chi sq test normally can't work with those dimenions anyway.
+## I guess we can run each 2x3 test separately?
+## or... does that 3rd dimensions not even matter? all the 2x2 combos effectively act as a single dimension?
+## Then we don't have to worry about the dimensionallity and can just do a C-A test.
+
+## Nope. it doesn't work afterall.
+
+```
+
+
+```{r Decision tree method (adaboost), include=F}
+library(fastAdaboost)
+
+train2 <- bfact[1:101, ]
+test2 <- bfact[102:nrow(bfact), ]
+
+ada <- adaboost(MRI_Cs2 ~ FCx_ICH_ipsi + TH_ICH_ipsi + GP_ICH_ipsi + Caudate_ICH_ipsi + PUT_ICH_ipsi + MB_peduncle_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi,
+                data=bfact, nIter=10)
+summary(ada)
+
+
+# see if can use train and test
+ada2 <- adaboost(MRI_Cs2 ~ FCx_ICH_ipsi + TH_ICH_ipsi + GP_ICH_ipsi + Caudate_ICH_ipsi + PUT_ICH_ipsi + MB_peduncle_ICH_ipsi + MB_ICH_C + Teg_ICH_ipsi,
+                data=train2, nIter=10)
+
+# possibly can increase the predictive power by choosing better/different parameters
+prd <- predict(ada2, test2)
+prd$error
+
+# confusion matrix
+table(prd$class, test2$MRI_Cs2)
+
+get_tree(ada2, 3)
+
+
+
+
+```
+
+
+
+
+
+```{r PLS Discriminant Analysis (this actually wants continuous independent variables...), include=FALSE}
+
+library(dplyr)
+library(DiscriMiner)
+
+# Select just the ipsi & contro parameters (and MRN and binary conscious status)
+#DAdat <- dplyr::select(loc_analyse.raw3, c(MRN, MRI_Cs2, AntPons_edema_contro:Cereb_ICH_ipsi))
+DAdat <- dplyr::select(loc_analyse.raw3, c(MRI_Cs2, follow2, AntPons_ICH_contro, AntPons_ICH_ipsi, Teg_ICH_contro, Teg_ICH_ipsi, MB_ICH_C,
+                                            MB_peduncle_ICH_contro, MB_peduncle_ICH_ipsi, GP_ICH_contro, GP_ICH_ipsi, PUT_ICH_contro, PUT_ICH_ipsi,
+                                            Caudate_ICH_contro, Caudate_ICH_ipsi, IC_ant_ICH_contro, IC_ant_ICH_ipsi, IC_post_ICH_contro,
+                                            IC_post_ICH_ipsi, FCx_ICH_contro, FCx_ICH_ipsi, PCx_ICH_contro, PCx_ICH_ipsi, TCx_ICH_contro,
+                                            TCx_ICH_ipsi, OCx_ICH_contro, OCx_ICH_ipsi, Cereb_ICH_contro, Cereb_ICH_ipsi, Vermis_ICH,
+                                            TH_ICH_contro, TH_ICH_ipsi)) 
+# have to convert everything to numeric.
+DAdat[,c(1:ncol(DAdat))] <- lapply( lapply(DAdat[,c(1:ncol(DAdat))], as.character), as.numeric )
+# exclude columns with all 0s
+exclude <- NULL
+for (v in names(DAdat)) {
+  if (all(DAdat[,v]==0)) {
+    exclude <- c(exclude, v)
+  }
+}
+
+DAdat <- DAdat[which(!names(DAdat) %in% exclude)]
+
+# fit model
+plsDAfitNewCS <- plsDA(variables=DAdat[,-c(1,2)], group=as.factor(DAdat$MRI_Cs2), autosel=F, comps=10)
+plsDAfitNewFol <- plsDA(variables=DAdat[,-c(1,2)], group=as.factor(DAdat$follow2), autosel=F, comps=10)
+
+plsDAfitNewCS$confusion
+plsDAfitNewCS$error_rate
+plot(plsDAfitNewCS)
+
+
+plsDAfitNewFol$confusion
+plsDAfitNewFol$error_rate
+plot(plsDAfitNewFol)
+
+
+
+
+```
+
+
+
+
+
+
+```{r Latent Class Analysis, include=FALSE}
+library(poLCA)
+
+# function to make this table for each model prediction
+modelClassTable <- function(data, prediction) {
+  library(reshape2)
+  library(dplyr)
+  # append prediction to the lesion location data
+  newTable <- cbind(prediction, data)
+  # melt table
+  newTable.m <- melt(newTable, id="prediction")
+  # now make summary percentage tables?
+  freqTable <- newTable.m %>%
+    group_by(prediction, variable, value) %>%
+    summarise(n = n()) %>%
+    mutate(freq = n / sum(n)) %>%
+    # want to only get percentages of how many patients had a lesion
+    filter(value == 2)
+
+
+  finalTable <- dcast(freqTable, variable ~ prediction, mean, value.var="freq", fill = 0)
+  
+  # round percentages
+  finalTable[,2:ncol(finalTable)] <- sapply(finalTable[,2:ncol(finalTable)], round, digits=2)
+
+  return(finalTable)
+}
+
+# Select just the ipsi & contro parameters (and binary conscious status)
+#LCAdat <- dplyr::select(loc_analyse.raw3, c(MRI_Cs2, AntPons_edema_contro:Cereb_ICH_ipsi))
+
+# select list of parameters Ben chose
+LCAdat <- dplyr::select(loc_analyse.raw3, c(MRI_Cs2, follow2, AntPons_ICH_contro, AntPons_ICH_ipsi, Teg_ICH_contro, Teg_ICH_ipsi, MB_ICH_C,
+                                            MB_peduncle_ICH_contro, MB_peduncle_ICH_ipsi, GP_ICH_contro, GP_ICH_ipsi, PUT_ICH_contro, PUT_ICH_ipsi,
+                                            Caudate_ICH_contro, Caudate_ICH_ipsi, IC_ant_ICH_contro, IC_ant_ICH_ipsi, IC_post_ICH_contro,
+                                            IC_post_ICH_ipsi, FCx_ICH_contro, FCx_ICH_ipsi, PCx_ICH_contro, PCx_ICH_ipsi, TCx_ICH_contro,
+                                            TCx_ICH_ipsi, OCx_ICH_contro, OCx_ICH_ipsi, Cereb_ICH_contro, Cereb_ICH_ipsi, Vermis_ICH,
+                                            TH_ICH_contro, TH_ICH_ipsi)) #IVH
+
+# turn everything to numeric so I can add 1 to all columns.
+LCAdat[,1:ncol(LCAdat)] <- lapply(lapply(LCAdat[,1:ncol(LCAdat)], as.character), as.numeric)
+
+# turn MRI_Cs2 to factor
+# LCAdat$MRI_Cs2 <- as.factor(LCAdat$MRI_Cs2)
+
+# add 1 to every column because this can't handel the value 0!!!
+# also add 1 to the consciousness column
+for (i in 1:ncol(LCAdat)) {
+  LCAdat[, i] <- LCAdat[, i] + 1
+}
+
+
+# back to factor!!!
+#LCAdat[,1:ncol(LCAdat)] <- lapply(LCAdat[,1:ncol(LCAdat)], as.factor)
+
+
+# formula needs to be in form of: response ~ 1 ...?
+#form <- cbind(MRI_Cs2) ~ 1
+
+# formulat with INDEPENDENT ~ DEPENDENT, for whatever backwards reason this function requires.
+form <- as.formula(paste("cbind(", paste(names(LCAdat)[-c(1,2)], collapse=","), ")", "~", 1,  sep=""))  # names(LCAdat)[1]
+
+LCAfit1 <- poLCA(form, data=LCAdat, nclass=1, maxiter=3000, nrep=10)
+LCAfit2 <- poLCA(form, data=LCAdat, nclass=2, maxiter=3000, nrep=10)
+LCAfit3 <- poLCA(form, data=LCAdat, nclass=3, maxiter=3000, nrep=10)  # 3 classes seems to always have the lower BIC
+LCAfit4 <- poLCA(form, data=LCAdat, nclass=4, maxiter=3000, nrep=10)
+LCAfit5 <- poLCA(form, data=LCAdat, nclass=5, maxiter=3000, nrep=10)
+
+# use these predicted classes, essentially cbind it to the main data table,
+# then make a count/percentage of how many patients in each class
+# had a 1 for each of the variables.
+LCAfit3$predclass
+
+BICtable <- data.frame(model=c('LCA1','LCA2','LCA3','LCA4','LCA5'),
+                       BIC=c(LCAfit1$bic, LCAfit2$bic, LCAfit3$bic, LCAfit4$bic, LCAfit5$bic))
+# LCAfit1$bic
+# LCAfit2$bic
+# LCAfit3$bic
+# LCAfit4$bic
+# LCAfit5$bic
+
+# model with smallest BIC
+BICtable$model[which(BICtable$BIC == min(BICtable$BIC))]
+
+
+
+
+
+LCAfit1Table <- modelClassTable(LCAdat, LCAfit1$predclass)
+LCAfit2Table <- modelClassTable(LCAdat, LCAfit2$predclass)
+LCAfit3Table <- modelClassTable(LCAdat, LCAfit3$predclass)
+LCAfit4Table <- modelClassTable(LCAdat, LCAfit4$predclass)
+LCAfit5Table <- modelClassTable(LCAdat, LCAfit5$predclass)
+
+
+
+
+
+```
+
+# tables should look like: (and need a seperate table for each model) - % of how many patients in each class had a lesion
+
+Brain Region                         Class 1            Class 2         Class 3       however many classes there are in the model...
+-----------                        -----------        -----------     ----------      --------------------------------------------
+AntPons_edema_contro                   30%
+AntPons_edema_ipsi                     10%
+AntPons_ICH_contro                     23%
+MB_ICH_C                               13%
+...                                    ...
+
+
+
+Table: Example table for Latent Class Analysis Results
+
+
+
+
+
